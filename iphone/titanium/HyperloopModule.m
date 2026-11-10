@@ -435,9 +435,63 @@ END_METHOD \
 }\
 
 /**
+ * returns [NSNull null] from the enclosing conversion when an exception is pending; the
+ * exception is logged once by JSValueRefToId rather than at every nesting level
+ */
+#define RETURN_NSNULL_ON_EXCEPTION \
+	if (exception && *exception != NULL) {\
+		return [NSNull null];\
+	}\
+
+/**
+ * adds obj to the conversion path (the set of objects being converted higher up the
+ * stack), creating the set on first use. Returns NO when obj is already on the path,
+ * i.e. the object graph is cyclic, and sets a JS Error on exception (or logs when the
+ * caller passed no exception pointer)
+ */
+static BOOL EnterConversionPath (JSContextRef ctx, CFMutableSetRef *path, JSObjectRef obj, JSValueRef *exception) {
+	if (*path == NULL) {
+		*path = CFSetCreateMutable(kCFAllocatorDefault, 0, NULL);
+	} else if (CFSetContainsValue(*path, obj)) {
+		static const char *message = "Hyperloop: cannot convert a cyclic object structure to a native value";
+		if (exception) {
+			JSStringRef messageString = JSStringCreateWithUTF8CString(message);
+			JSValueRef args[] = { JSValueMakeString(ctx, messageString) };
+			JSStringRelease(messageString);
+			*exception = JSObjectMakeError(ctx, 1, args, NULL);
+		} else {
+			NSLog(@"[ERROR] %s; converting the cyclic reference to null", message);
+		}
+		return NO;
+	}
+	CFSetAddValue(*path, obj);
+	return YES;
+}
+
+static id JSValueRefToIdWithPath (JSContextRef ctx, const JSValueRef value, JSValueRef *exception, CFMutableSetRef *path);
+
+/**
  * convert a JSValueRef to an NSObject
  */
 id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *exception) {
+	BOOL hadException = exception && *exception != NULL;
+	CFMutableSetRef path = NULL;
+	id result;
+	@try {
+		result = JSValueRefToIdWithPath(ctx, value, exception, &path);
+	} @finally {
+		if (path) {
+			CFRelease(path);
+		}
+	}
+	if (!hadException && exception && *exception != NULL) {
+		id ex = JSValueRefToId(ctx, *exception, NULL);
+		NSLog(@"[ERROR] JS Exception detected %@", ex);
+	}
+	return result;
+}
+
+static id JSValueRefToIdWithPath (JSContextRef ctx, const JSValueRef value, JSValueRef *exception, CFMutableSetRef *path) {
 	switch (JSValueGetType(ctx, value)) {
 		case kJSTypeUndefined:
 		case kJSTypeNull: {
@@ -454,14 +508,14 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 		}
 		case kJSTypeObject: {
 			JSObjectRef obj = JSValueToObject(ctx, value, exception);
-			CHECKEXCEPTION_NSNULL
+			RETURN_NSNULL_ON_EXCEPTION
 			if (JSValueIsObjectOfClass(ctx, value, pointerClassRef) ||
 				JSValueIsObjectOfClass(ctx, value, classClassRef) ||
 				JSValueIsObjectOfClass(ctx, value, constructorClassRef)) {
 				return (__bridge id)JSObjectGetPrivate(obj);
 			} else if (HLValueIsDate(ctx, value)) {
 				double ms = JSValueToNumber(ctx, value, exception);
-				CHECKEXCEPTION_NSNULL
+				RETURN_NSNULL_ON_EXCEPTION
 				return [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval) (ms / 1000)];
 			} else if (JSObjectIsFunction(ctx, obj)) {
 				if (context == nil) {
@@ -471,32 +525,38 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 			} else if (HLValueIsArray(ctx, obj)) {
 				JSStringRef prop = JSStringCreateWithUTF8CString("length");
 				JSValueRef lengthValue = JSObjectGetProperty(ctx, obj, prop, exception);
-				CHECKEXCEPTION_NSNULL
+				JSStringRelease(prop);
+				RETURN_NSNULL_ON_EXCEPTION
 				double len = JSValueToNumber(ctx, lengthValue, exception);
-				CHECKEXCEPTION_NSNULL
+				RETURN_NSNULL_ON_EXCEPTION
+				if (!EnterConversionPath(ctx, path, obj, exception)) {
+					return [NSNull null];
+				}
 				NSMutableArray *result = [NSMutableArray arrayWithCapacity:len];
 				for (unsigned c = 0; c < len; c++) {
 					JSValueRef val = JSObjectGetPropertyAtIndex(ctx, obj, c, exception);
-					CHECKEXCEPTION_NSNULL
-					id value = JSValueRefToId(ctx, val, exception);
+					if (exception && *exception) break;
+					id value = JSValueRefToIdWithPath(ctx, val, exception, path);
+					if (exception && *exception) break;
 					[result addObject:value];
 				}
-				JSStringRelease(prop);
+				CFSetRemoveValue(*path, obj);
+				RETURN_NSNULL_ON_EXCEPTION
 				return result;
 			} else if (isJSRegExp(ctx, obj, exception)) {
 				NSRegularExpressionOptions options = 0;
 				NSError *error = nil;
 				JSStringRef source = JSStringCreateWithUTF8CString("source");
 				JSValueRef sourceValue = JSObjectGetProperty(ctx, obj, source, exception);
-				CHECKEXCEPTION_NSNULL
+				JSStringRelease(source);
+				RETURN_NSNULL_ON_EXCEPTION
 				if (TiPropToBool(ctx, obj, "multiline", exception)) {
 					options |= NSRegularExpressionAnchorsMatchLines;
 				}
 				if (TiPropToBool(ctx, obj, "ignoreCase", exception)) {
 					options |= NSRegularExpressionCaseInsensitive;
 				}
-				NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:JSValueRefToId(ctx, sourceValue, exception) options:options error:&error];
-				JSStringRelease(source);
+				NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:JSValueRefToIdWithPath(ctx, sourceValue, exception, path) options:options error:&error];
 				if (error) {
 					if (exception) {
 						*exception = NSErrorToJSException(ctx, error);
@@ -521,13 +581,22 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 					}
 					return po;
 				}
+				// obj stays on the path for its $native value and for every property,
+				// including the message/stack lookups below, so cycles through any of them are caught
+				if (!EnterConversionPath(ctx, path, obj, exception)) {
+					return [NSNull null];
+				}
 				JSStringRef prop = JSStringCreateWithUTF8CString("$native");
-				if (JSObjectHasProperty(ctx, obj, prop)) {
+				BOOL hasNative = JSObjectHasProperty(ctx, obj, prop);
+				if (hasNative) {
 					JSValueRef nativeRef = JSObjectGetProperty(ctx, obj, prop, exception);
-					CHECKEXCEPTION_NSNULL
-					id nativeObj = JSValueRefToId(ctx, nativeRef, exception);
-					CHECKEXCEPTION_NSNULL
 					JSStringRelease(prop);
+					id nativeObj = [NSNull null];
+					if (!(exception && *exception)) {
+						nativeObj = JSValueRefToIdWithPath(ctx, nativeRef, exception, path);
+					}
+					CFSetRemoveValue(*path, obj);
+					RETURN_NSNULL_ON_EXCEPTION
 					return nativeObj;
 				}
 				JSStringRelease(prop);
@@ -537,25 +606,32 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 				for (unsigned c = 0; c < len; c++) {
 					JSStringRef name = JSPropertyNameArrayGetNameAtIndex(props, c);
 					JSValueRef val = JSObjectGetProperty(ctx, obj, name, exception);
-					id value = JSValueRefToId(ctx, val, exception);
+					if (exception && *exception) break;
+					id value = JSValueRefToIdWithPath(ctx, val, exception, path);
+					if (exception && *exception) break;
 					[result setObject:value forKey:NSStringFromJSStringRef(ctx, name, exception)];
 				}
+				JSPropertyNameArrayRelease(props);
 				// if it looks like an exception, add the message to the output
 				// FIXME: test for constructor instead
-				if ([result objectForKey:@"line"] && [result objectForKey:@"column"]) {
-					JSStringRef prop = JSStringCreateWithUTF8CString("message");
-					JSValueRef val = JSObjectGetProperty(ctx, obj, prop, exception);
-					id value = JSValueRefToId(ctx, val, exception);
-					[result setObject:value forKey:NSStringFromJSStringRef(ctx, prop, exception)];
-					JSStringRelease(prop);
-
-					prop = JSStringCreateWithUTF8CString("stack");
-					val = JSObjectGetProperty(ctx, obj, prop, exception);
-					value = JSValueRefToId(ctx, val, exception);
-					[result setObject:value forKey:NSStringFromJSStringRef(ctx, prop, exception)];
-					JSStringRelease(prop);
+				if (!(exception && *exception) && [result objectForKey:@"line"] && [result objectForKey:@"column"]) {
+					const char *names[] = { "message", "stack" };
+					for (unsigned c = 0; c < 2; c++) {
+						JSStringRef name = JSStringCreateWithUTF8CString(names[c]);
+						JSValueRef val = JSObjectGetProperty(ctx, obj, name, exception);
+						id value = nil;
+						if (!(exception && *exception)) {
+							value = JSValueRefToIdWithPath(ctx, val, exception, path);
+						}
+						if (value && !(exception && *exception)) {
+							[result setObject:value forKey:NSStringFromJSStringRef(ctx, name, exception)];
+						}
+						JSStringRelease(name);
+						if (exception && *exception) break;
+					}
 				}
-				JSPropertyNameArrayRelease(props);
+				CFSetRemoveValue(*path, obj);
+				RETURN_NSNULL_ON_EXCEPTION
 				return result;
 			}
 		}
@@ -611,6 +687,9 @@ static JSObjectRef Constructor (JSContextRef ctx, JSObjectRef constructor, size_
 	id obj;
 	if (argumentCount) {
 		obj = JSValueRefToId(ctx, arguments[0], exception);
+		if (exception && *exception != NULL) {
+			return NULL;
+		}
 	} else {
 		HyperloopClass *cls = (__bridge HyperloopClass *)JSObjectGetPrivate(constructor);
 		Class customClass = (Class)[cls target];

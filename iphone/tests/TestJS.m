@@ -635,6 +635,79 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertNotNil(result);
 }
 
+-(id)convertScript:(const char *)source exception:(JSValueRef *)exception {
+	JSStringRef script = JSStringCreateWithUTF8CString(source);
+	JSValueRef value = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, exception);
+	JSStringRelease(script);
+	XCTAssertTrue(*exception == NULL);
+	return JSValueRefToId(_ctx.context, value, exception);
+}
+
+-(void)assertCyclicError:(JSValueRef)exception {
+	XCTAssertTrue(exception != NULL);
+	JSValueRef ignored = NULL;
+	NSString *message = NSStringFromJSValueRef(_ctx.context, exception, &ignored);
+	XCTAssertTrue([message containsString:@"cannot convert a cyclic object structure"], @"unexpected exception: %@", message);
+}
+
+-(void)testCyclicObjectThrows {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var o = { a: 1 }; o.self = o; return o; })()" exception:&exception];
+	[self assertCyclicError:exception];
+	XCTAssertEqualObjects(obj, [NSNull null]);
+}
+
+-(void)testCyclicArrayThrows {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var a = [1]; a.push(a); return a; })()" exception:&exception];
+	[self assertCyclicError:exception];
+	XCTAssertEqualObjects(obj, [NSNull null]);
+}
+
+-(void)testCyclicThroughNestedArrayThrows {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var parent = { children: [] }; parent.children.push({ parent: parent }); return parent; })()" exception:&exception];
+	[self assertCyclicError:exception];
+	XCTAssertEqualObjects(obj, [NSNull null]);
+}
+
+-(void)testCyclicThroughNativePropertyThrows {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var o = {}; o.$native = { back: o }; return o; })()" exception:&exception];
+	[self assertCyclicError:exception];
+	XCTAssertEqualObjects(obj, [NSNull null]);
+}
+
+-(void)testCyclicThroughErrorMessageThrows {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var o = { line: 1, column: 2 }; Object.defineProperty(o, 'message', { enumerable: false, get: function() { return { back: o }; } }); return o; })()" exception:&exception];
+	[self assertCyclicError:exception];
+	XCTAssertEqualObjects(obj, [NSNull null]);
+}
+
+-(void)testSharedReferenceConverts {
+	JSValueRef exception = NULL;
+	id obj = [self convertScript:"(function() { var x = { v: 1 }; return { a: x, b: [x, x] }; })()" exception:&exception];
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue([obj isKindOfClass:[NSDictionary class]]);
+	NSDictionary *expected = @{ @"v": @1 };
+	XCTAssertEqualObjects(obj[@"a"], expected);
+	NSArray *expectedArray = @[ expected, expected ];
+	XCTAssertEqualObjects(obj[@"b"], expectedArray);
+}
+
+-(void)testCyclicObjectWithoutExceptionPointerConvertsBackEdgeToNull {
+	JSStringRef script = JSStringCreateWithUTF8CString("(function() { var o = { a: 1 }; o.self = o; return o; })()");
+	JSValueRef exception = NULL;
+	JSValueRef value = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	id obj = JSValueRefToId(_ctx.context, value, NULL);
+	XCTAssertTrue([obj isKindOfClass:[NSDictionary class]]);
+	XCTAssertEqualObjects(obj[@"a"], @1);
+	XCTAssertEqualObjects(obj[@"self"], [NSNull null]);
+}
+
 @end
 
 #pragma clang diagnostic pop
