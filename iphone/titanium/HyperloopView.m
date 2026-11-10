@@ -13,6 +13,19 @@
 JSObjectRef HyperloopGetWrapperForId(id obj);
 JSContextRef HyperloopCurrentContext();
 
+/**
+ * the wrapper protected in `protectFromGC` and the context it was protected in, kept so that
+ * `unprotectFromGC` releases exactly that object. Looking the wrapper up again at dealloc can
+ * yield a different wrapper registered later for the same native object (dropping a protection
+ * someone else holds), and dealloc may run inside a GC finalizer, where the weak wrapper cache
+ * must not be read and the unprotect itself has to be deferred.
+ */
+@interface HyperloopView () {
+	JSGlobalContextRef _protectedContext;
+	JSObjectRef _protectedWrapper;
+}
+@end
+
 @implementation HyperloopView
 
 -(instancetype)initWithView:(UIView*)view andProxy:(TiProxy*)_proxy {
@@ -46,16 +59,28 @@ JSContextRef HyperloopCurrentContext();
 
 -(void)protectFromGC {
 	JSObjectRef wrapper = HyperloopGetWrapperForId(_nativeProxy);
-	if (wrapper != NULL) {
-		JSValueProtect(HyperloopCurrentContext(), wrapper);
+	if (wrapper == NULL) {
+		return;
 	}
+	// retain the global context so the unprotect stays valid if Hyperloop's context is torn down first
+	_protectedContext = JSGlobalContextRetain(JSContextGetGlobalContext(HyperloopCurrentContext()));
+	_protectedWrapper = wrapper;
+	JSValueProtect(_protectedContext, _protectedWrapper);
 }
 
 -(void)unprotectFromGC {
-	JSObjectRef wrapper = HyperloopGetWrapperForId(_nativeProxy);
-	if (wrapper != NULL) {
-		JSValueUnprotect(HyperloopCurrentContext(), wrapper);
+	if (_protectedWrapper == NULL) {
+		return;
 	}
+	JSGlobalContextRef ctx = _protectedContext;
+	JSObjectRef wrapper = _protectedWrapper;
+	_protectedWrapper = NULL;
+	_protectedContext = NULL;
+	// deferred: dealloc can run inside a GC finalizer, where calling into JavaScriptCore is unsafe
+	dispatch_async(dispatch_get_main_queue(), ^{
+		JSValueUnprotect(ctx, wrapper);
+		JSGlobalContextRelease(ctx);
+	});
 }
 
 -(void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
