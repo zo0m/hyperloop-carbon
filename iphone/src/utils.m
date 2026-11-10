@@ -314,10 +314,12 @@ case enc: {\
 						void *value = [result pointerValue];
 						[invocation getReturnValue:value];
 					} else {
-						void *value = malloc(length);
+						// The returned address is borrowed: the callee (or an object it
+						// belongs to, e.g. NSData.bytes) owns the pointee. Wrap the address
+						// itself without copying or freeing it.
+						void *value = NULL;
 						[invocation getReturnValue:&value];
-						result = [HyperloopPointer pointer:value encoding:type];
-						free(value);
+						result = [HyperloopPointer create:value encoding:type];
 					}
 					break;
 				}

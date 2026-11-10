@@ -4,6 +4,7 @@
  */
 
 #import <XCTest/XCTest.h>
+#import <objc/runtime.h>
 #import "class.h"
 #import "pointer.h"
 #import "utils.h"
@@ -86,6 +87,47 @@
 }
 @end
 
+static const unsigned char TestPointerReturnStaticBytes[16] = {
+	0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+	0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C
+};
+
+/**
+ * Methods returning pointers the caller does not own: the bridge must wrap
+ * the returned address and must never free it.
+ */
+@interface TestPointerReturnMock : NSObject
+@end
+
+@implementation TestPointerReturnMock
+-(void *)staticVoidPointer {
+	return (void *)TestPointerReturnStaticBytes;
+}
+-(void *)nullVoidPointer {
+	return NULL;
+}
+@end
+
+static unsigned char *TestPointerReturnBytePointerIMP(id self, SEL _cmd) {
+	return (unsigned char *)TestPointerReturnStaticBytes;
+}
+
+/**
+ * clang encodes every `char *` flavor (including `unsigned char *`) as `*`,
+ * so a `^C` return is only produced by an explicit runtime type string.
+ */
+static SEL TestPointerReturnBytePointerSelector(void) {
+	static dispatch_once_t once;
+	SEL sel = NSSelectorFromString(@"staticBytePointer");
+	dispatch_once(&once, ^{
+		BOOL added = class_addMethod([TestPointerReturnMock class], sel, (IMP)TestPointerReturnBytePointerIMP, "^C@:");
+		if (!added) {
+			abort();
+		}
+	});
+	return sel;
+}
+
 @implementation TestDispatch
 
 #ifdef HYPERLOOP_MEMORY_TRACKING
@@ -144,6 +186,93 @@
 	HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(testWithIntPointerResult:) args:@[ptr] target:cls instance:YES];
 	XCTAssertEqual([[result valueAtIndex:0] intValue], 1);
 	XCTAssertEqual([[result valueAtIndex:1] intValue], 2);
+}
+
+- (void)testStaticVoidPointerResultIsBorrowed {
+	TestPointerReturnMock *mock = [[TestPointerReturnMock alloc] init];
+	XCTAssertEqual(strcmp([[mock methodSignatureForSelector:@selector(staticVoidPointer)] methodReturnType], @encode(void *)), 0);
+	__weak HyperloopPointer *weakResult = nil;
+	@autoreleasepool {
+		HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(staticVoidPointer) args:nil target:mock instance:YES];
+		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqualObjects([result encoding], @"^v");
+		XCTAssertEqual([result pointerValue], (void *)TestPointerReturnStaticBytes);
+		XCTAssertEqual(memcmp([result pointerValue], TestPointerReturnStaticBytes, sizeof(TestPointerReturnStaticBytes)), 0);
+		weakResult = result;
+		result = nil;
+	}
+	XCTAssertNil(weakResult);
+	// static storage must be untouched by dispatch and wrapper cleanup
+	const unsigned char expected[16] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C };
+	XCTAssertEqual(memcmp(TestPointerReturnStaticBytes, expected, sizeof(expected)), 0);
+}
+
+- (void)testNSDataBytesResultIsBorrowed {
+	const NSUInteger length = 4096;
+	unsigned char *expected = malloc(length);
+	for (NSUInteger i = 0; i < length; i++) {
+		expected[i] = (unsigned char)(i * 31 + 7);
+	}
+	NSData *owner = nil;
+	@autoreleasepool {
+		owner = [[NSData alloc] initWithBytes:expected length:length];
+	}
+	const void *ownerBytes = owner.bytes;
+	__weak HyperloopPointer *weakResult = nil;
+	@autoreleasepool {
+		HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(bytes) args:nil target:owner instance:YES];
+		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqual([result pointerValue], ownerBytes);
+		XCTAssertEqual(memcmp([result pointerValue], expected, length), 0);
+		XCTAssertEqual(memcmp(owner.bytes, expected, length), 0);
+		weakResult = result;
+		result = nil;
+	}
+	XCTAssertNil(weakResult);
+	// the live owner's buffer survives wrapper cleanup unchanged
+	XCTAssertEqual(owner.bytes, ownerBytes);
+	XCTAssertEqual(memcmp(owner.bytes, expected, length), 0);
+	@autoreleasepool {
+		owner = nil;
+	}
+	free(expected);
+}
+
+- (void)testUnsignedCharPointerResultIsBorrowed {
+	SEL sel = TestPointerReturnBytePointerSelector();
+	TestPointerReturnMock *mock = [[TestPointerReturnMock alloc] init];
+	XCTAssertEqual(strcmp([[mock methodSignatureForSelector:sel] methodReturnType], "^C"), 0);
+	__weak HyperloopPointer *weakResult = nil;
+	@autoreleasepool {
+		HyperloopPointer *result = [HyperloopUtils invokeSelector:sel args:nil target:mock instance:YES];
+		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqualObjects([result encoding], @"^C");
+		XCTAssertEqual([result pointerValue], (void *)TestPointerReturnStaticBytes);
+		for (NSUInteger i = 0; i < sizeof(TestPointerReturnStaticBytes); i++) {
+			XCTAssertEqual([[result valueAtIndex:i] unsignedCharValue], TestPointerReturnStaticBytes[i]);
+		}
+		weakResult = result;
+		result = nil;
+	}
+	XCTAssertNil(weakResult);
+	XCTAssertEqual(TestPointerReturnStaticBytes[0], 0xDE);
+	XCTAssertEqual(TestPointerReturnStaticBytes[15], 0x0C);
+}
+
+- (void)testNullVoidPointerResult {
+	TestPointerReturnMock *mock = [[TestPointerReturnMock alloc] init];
+	__weak HyperloopPointer *weakResult = nil;
+	@autoreleasepool {
+		HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(nullVoidPointer) args:nil target:mock instance:YES];
+		// a NULL pointer return is still wrapped (not nil), as for any other pointer return
+		XCTAssertNotNil(result);
+		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqualObjects([result encoding], @"^v");
+		XCTAssertTrue([result pointerValue] == NULL);
+		weakResult = result;
+		result = nil;
+	}
+	XCTAssertNil(weakResult);
 }
 
 - (void)testWithIntValue {
