@@ -55,10 +55,11 @@ static KrollContext *context = nil;
 static KrollBridge *bridge = nil;
 static NSMutableDictionary <NSString *, KrollCallback *> * callbacks = nil;
 static NSMutableDictionary <NSString *, KrollWrapper *> * modules = nil;
-static CFMutableDictionaryRef javaScriptWrappers = NULL;
+static NSMutableDictionary<NSString *, JSManagedValue *> *javaScriptWrappers = nil;
+static NSUInteger javaScriptWrappersPurgeThreshold = 1024;
 
 static NSString* HyperloopGetMemoryAddressOfId(id data);
-static void HyperloopRegisterWrapper(id pointer, JSValueRef thisObject);
+static void HyperloopRegisterWrapper(JSContextRef ctx, id pointer, JSObjectRef thisObject);
 static JSObjectRef HLObjectMake(JSContextRef ctx, JSClassRef cls, id obj);
 JSObjectRef HyperloopGetWrapperForId(id obj);
 
@@ -77,10 +78,9 @@ static void HyperloopRelease () {
 		callbacks = nil;
 		modules = nil;
 	}
-	if (javaScriptWrappers) {
-		CFRelease(javaScriptWrappers);
-		javaScriptWrappers = NULL;
-	}
+	[javaScriptWrappers removeAllObjects];
+	javaScriptWrappers = nil;
+	javaScriptWrappersPurgeThreshold = 1024;
 }
 
 /**
@@ -119,38 +119,58 @@ static NSString* HyperloopGetMemoryAddressOfId (id data) {
 }
 
 /**
- * stores the JS object in a non-retaining dictionay, `javaScriptWrappers`, using the memory
- * address (as a string) from an Objective-C object as the key
+ * removes entries whose wrapper has been garbage collected. Runs only when the dictionary has
+ * doubled since the last purge, so the cost is amortized O(1) per registration. Must not be
+ * called from a GC finalizer: reading or releasing a JSManagedValue calls into JavaScriptCore.
  */
-static void HyperloopRegisterWrapper (id pointer, JSValueRef thisObject) {
+static void HyperloopPurgeCollectedWrappers () {
+	if (javaScriptWrappers.count < javaScriptWrappersPurgeThreshold) {
+		return;
+	}
+	@autoreleasepool {
+		NSMutableArray<NSString *> *collected = [NSMutableArray array];
+		[javaScriptWrappers enumerateKeysAndObjectsUsingBlock:^(NSString *key, JSManagedValue *managed, BOOL *stop) {
+			if (managed.value == nil) {
+				[collected addObject:key];
+			}
+		}];
+		[javaScriptWrappers removeObjectsForKeys:collected];
+	}
+	javaScriptWrappersPurgeThreshold = MAX(1024, javaScriptWrappers.count * 2);
+}
+
+/**
+ * stores a weak (GC-aware) reference to the JS wrapper in `javaScriptWrappers`, using the memory
+ * address (as a string) from an Objective-C object as the key. The weak handle is cleared by the
+ * garbage collector before the wrapper's memory can be reused, so a lookup never yields a dead object.
+ */
+static void HyperloopRegisterWrapper (JSContextRef ctx, id pointer, JSObjectRef thisObject) {
 	if (pointer == nil || thisObject == NULL) {
 		return;
 	}
-	if (javaScriptWrappers == NULL) {
-		javaScriptWrappers = CFDictionaryCreateMutable(NULL, 0, &kCFCopyStringDictionaryKeyCallBacks, NULL);
-		CFRetain(javaScriptWrappers);
+	if (javaScriptWrappers == nil) {
+		javaScriptWrappers = [NSMutableDictionary dictionary];
 	}
-	CFStringRef pointerString = (__bridge CFStringRef)HyperloopGetMemoryAddressOfId(pointer);
-	if (CFDictionaryContainsKey(javaScriptWrappers, pointerString)) {
-		 // NSLog(@"[HYPERLOOP] Wrapper replaced %@ %@",pointerString, [pointer class]);
-		CFDictionaryReplaceValue(javaScriptWrappers, javaScriptWrappers, thisObject);
-	} else {
-		 // NSLog(@"[HYPERLOOP] Wrapper registered %@ %@", pointerString, [pointer class]);
-		CFDictionaryAddValue(javaScriptWrappers, pointerString, thisObject);
-	}
+	HyperloopPurgeCollectedWrappers();
+	NSString *key = HyperloopGetMemoryAddressOfId(pointer);
+	JSContext *jsContext = [JSContext contextWithJSGlobalContextRef:JSContextGetGlobalContext(ctx)];
+	JSValue *value = [JSValue valueWithJSValueRef:thisObject inContext:jsContext];
+	javaScriptWrappers[key] = [JSManagedValue managedValueWithValue:value];
 }
 
 /**
  * gets the js object stored in the `javaScriptWrappers` dictionary using the memory
  * address (as a string) from an Objective-C object as the key. Returns NULL if not found
+ * or if the wrapper has been garbage collected. Read-only: collected entries are removed
+ * by `HyperloopPurgeCollectedWrappers`, since this is also reached from dealloc during GC.
  */
 JSObjectRef HyperloopGetWrapperForId (id obj) {
-	if (javaScriptWrappers == NULL || obj == nil) { return NULL; }
+	if (javaScriptWrappers == nil || obj == nil) { return NULL; }
 
-	CFStringRef key = (__bridge CFStringRef)HyperloopGetMemoryAddressOfId(obj);
 	JSObjectRef result = NULL;
-	if (CFDictionaryContainsKey(javaScriptWrappers, key)) {
-		result = (JSObjectRef)CFDictionaryGetValue(javaScriptWrappers, key);
+	@autoreleasepool {
+		JSManagedValue *managed = javaScriptWrappers[HyperloopGetMemoryAddressOfId(obj)];
+		result = (JSObjectRef)managed.value.JSValueRef;
 	}
 	return result;
 }
@@ -595,12 +615,6 @@ static void Finalizer (JSObjectRef object) {
 		NSLog(@"[HYPERLOOP] Finalizer %@ %p", [[obj target] class], [obj target]);
 	}
 #endif
-	if (javaScriptWrappers != NULL) {
-		CFStringRef key = (__bridge CFStringRef)HyperloopGetMemoryAddressOfId(obj);
-		if (CFDictionaryContainsKey(javaScriptWrappers, key)) {
-			CFDictionaryRemoveValue(javaScriptWrappers, key);
-		}
-	}
 	ARCRelease(obj);
 }
 
@@ -701,7 +715,7 @@ JS_CALLBACK(RegisterWrapper)
 		// 	NSLog(@"[HYPERLOOP] RegisterWrapper %@ %p", [[nativePointer target] class], [nativePointer target]);
 		// }
 	}
-	HyperloopRegisterWrapper(nativePointer, thisObject);
+	HyperloopRegisterWrapper(ctx, nativePointer, thisObject);
 	return JSValueMakeUndefined(ctx);
 JS_CALLBACK_END
 
