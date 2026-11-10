@@ -162,7 +162,7 @@ static void HyperloopRegisterWrapper (JSContextRef ctx, id pointer, JSObjectRef 
  * gets the js object stored in the `javaScriptWrappers` dictionary using the memory
  * address (as a string) from an Objective-C object as the key. Returns NULL if not found
  * or if the wrapper has been garbage collected. Read-only: collected entries are removed
- * by `HyperloopPurgeCollectedWrappers`, since this is also reached from dealloc during GC.
+ * by `HyperloopPurgeCollectedWrappers`. Like the purge, it must not be called from a GC finalizer.
  */
 JSObjectRef HyperloopGetWrapperForId (id obj) {
 	if (javaScriptWrappers == nil || obj == nil) { return NULL; }
