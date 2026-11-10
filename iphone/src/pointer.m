@@ -479,10 +479,15 @@ NSString *cleanEncoding (NSString *encoding) {
 
 #pragma - mark HyperloopPointer
 
-@implementation HyperloopPointer
+@implementation HyperloopPointer {
+	// storage this wrapper owns for a copied (assign:NO) value or pointer encoding; _pointer points
+	// into it and is valid for as long as this wrapper keeps it. nil when _pointer is borrowed
+	// (assign:YES) or the encoding is held elsewhere (_structure, object, class, selector, string).
+	NSMutableData *_storage;
+}
 
 @synthesize nativeObject = _nativeObject;
-+(void *)createMemoryForEncoding:(const char *)encoding pointer:(const void *)pointer {
++(NSMutableData *)createMemoryForEncoding:(const char *)encoding pointer:(const void *)pointer {
 	NSUInteger size = [HyperloopValue lengthForEncoding:encoding];
 #if defined(DEALLOC_DEBUG) && DEALLOC_DEBUG == 1
 	NSLog(@"creating %lu bytes of memory with encoding %s", size, encoding);
@@ -494,10 +499,13 @@ NSString *cleanEncoding (NSString *encoding) {
 	else {
 		pointerData = [NSMutableData dataWithLength:size];
 	}
-	return [pointerData mutableBytes];
+	return pointerData;
 }
 
 -(void)setValue:(const void *)pointer encoding:(const char *)encoding assign:(BOOL)assign {
+	// pointer may point into the storage being replaced; keep it alive until the copy is made
+	NS_VALID_UNTIL_END_OF_SCOPE NSMutableData *previousStorage = _storage;
+	_storage = nil;
 	RELEASE_AND_CHECK(_value);
 	RELEASE_AND_CHECK(_structure);
 	if (_pointer) {
@@ -532,7 +540,8 @@ NSString *cleanEncoding (NSString *encoding) {
 		_structure = nil;
 	} else {
 		if (!assign) {
-			_pointer = [HyperloopPointer createMemoryForEncoding:sencoding pointer:pointer];
+			_storage = [HyperloopPointer createMemoryForEncoding:sencoding pointer:pointer];
+			_pointer = [_storage mutableBytes];
 		} else {
 			_pointer = (void *)pointer;
 		}
@@ -573,8 +582,10 @@ NSString *cleanEncoding (NSString *encoding) {
 }
 
 +(instancetype)encoding:(const char *)encoding {
-	void *pointer = [HyperloopPointer createMemoryForEncoding:encoding pointer:nil];
-	return [[HyperloopPointer alloc] initWithPointer:pointer encoding:encoding assign:YES framework:nil classname:nil];
+	// zero-filled source of lengthForEncoding bytes; non-struct value and pointer encodings copy it
+	// into storage owned by the new wrapper
+	NS_VALID_UNTIL_END_OF_SCOPE NSMutableData *zeroed = [HyperloopPointer createMemoryForEncoding:encoding pointer:nil];
+	return [[HyperloopPointer alloc] initWithPointer:[zeroed bytes] encoding:encoding assign:NO framework:nil classname:nil];
 }
 
 #define GETVALUE(type, name, def) \
@@ -855,9 +866,35 @@ case t: {\
 	return nil;
 }
 
+/**
+ * write one element into the storage this wrapper owns, in place, so its address (exposed through
+ * pointerValue and used as the JS wrapper key) stays stable and the other elements are kept
+ */
+-(void)writeOwnedElement:(const void *)element size:(NSUInteger)size index:(NSUInteger)index stride:(NSUInteger)stride {
+	NSUInteger length = [_storage length];
+	if (stride == 0 || size > length || index > (length - size) / stride) {
+		@throw [NSException exceptionWithName:@"InvalidArgument" reason:[NSString stringWithFormat:@"element at %lu is outside the %lu bytes of %@", (unsigned long)index, (unsigned long)length, _encoding] userInfo:nil];
+	}
+	memcpy((char *)_pointer + index * stride, element, size);
+	if ([_encoding characterAtIndex:0] != '^') {
+		// value encodings are read through the copy in _value; refresh it from the storage
+		_value = [[HyperloopValue alloc] initWithObject:[NSValue valueWithBytes:_pointer objCType:[_encoding UTF8String]] isPointer:NO];
+	}
+}
+
 #define SETOBJECTAT(t, type, name) \
 case t: {\
 	if(len == 0) {\
+		return;\
+	}\
+	if (_storage) {\
+		type ov = [HyperloopPointer name##Value:value];\
+		NSUInteger size = 0, stride = 0;\
+		NSGetSizeAndAlignment([enc UTF8String], &size, &stride);\
+		if (size != sizeof(type)) {\
+			@throw [NSException exceptionWithName:@"InvalidArgument" reason:[NSString stringWithFormat:@"cannot store a %lu byte value in a %lu byte %@ element", (unsigned long)sizeof(type), (unsigned long)size, enc] userInfo:nil];\
+		}\
+		[self writeOwnedElement:&ov size:size index:index stride:stride];\
 		return;\
 	}\
 	void *v = malloc(len);\
@@ -871,7 +908,8 @@ case t: {\
 	}\
 	type nv = [HyperloopPointer name##Value:value];\
 	*(type *)tmp = nv;\
-	[self setValue:v encoding:[_encoding UTF8String] assign:YES];\
+	[self setValue:v encoding:[_encoding UTF8String] assign:NO];\
+	free(v);\
 	return;\
 }\
 
