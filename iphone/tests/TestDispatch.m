@@ -128,6 +128,74 @@ static SEL TestPointerReturnBytePointerSelector(void) {
 	return sel;
 }
 
+/**
+ * Counts allocations and deallocations so tests can check that the bridge
+ * neither leaks nor over-releases instances it constructs. Initializers follow
+ * ARC init-family conventions: they consume self and return +1.
+ */
+static NSInteger TestInitOwnershipAllocs;
+static NSInteger TestInitOwnershipDeallocs;
+static NSInteger TestInitReplacementAllocs;
+static NSInteger TestInitReplacementDeallocs;
+
+static void TestInitOwnershipResetCounters(void) {
+	TestInitOwnershipAllocs = 0;
+	TestInitOwnershipDeallocs = 0;
+	TestInitReplacementAllocs = 0;
+	TestInitReplacementDeallocs = 0;
+}
+
+@interface TestInitReplacement : NSObject
+@end
+
+@implementation TestInitReplacement
++(instancetype)allocWithZone:(struct _NSZone *)zone {
+	TestInitReplacementAllocs++;
+	return [super allocWithZone:zone];
+}
+-(void)dealloc {
+	TestInitReplacementDeallocs++;
+}
+@end
+
+@interface TestInitOwnershipMock : NSObject
+@property (nonatomic, assign) NSInteger value;
+@end
+
+@implementation TestInitOwnershipMock
++(instancetype)allocWithZone:(struct _NSZone *)zone {
+	TestInitOwnershipAllocs++;
+	return [super allocWithZone:zone];
+}
++(id)nilFactory {
+	return nil;
+}
+-(instancetype)initReturningNil {
+	// ARC releases the consumed self here, like a failing Foundation initializer.
+	self = [super init];
+	return nil;
+}
+-(instancetype)initWithValue:(NSInteger)value {
+	if (self = [super init]) {
+		_value = value;
+	}
+	return self;
+}
+-(id)initReturningReplacement {
+	// ARC releases the consumed self and returns the replacement at +1.
+	return [[TestInitReplacement alloc] init];
+}
+-(instancetype)initThrowing {
+	@throw [NSException exceptionWithName:@"TestInitFailure" reason:@"initializer failed" userInfo:nil];
+}
+-(id)nilObject {
+	return nil;
+}
+-(void)dealloc {
+	TestInitOwnershipDeallocs++;
+}
+@end
+
 @implementation TestDispatch
 
 #ifdef HYPERLOOP_MEMORY_TRACKING
@@ -439,6 +507,115 @@ static SEL TestPointerReturnBytePointerSelector(void) {
 		CFRelease(registeredProxies);
 		proxy = nil;
 	}
+}
+
+- (void)testInitializerReturningNil {
+	TestInitOwnershipResetCounters();
+	@autoreleasepool {
+		HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:YES init:@selector(initReturningNil) args:nil];
+		XCTAssertNotNil(cls);
+		XCTAssertNil(cls.nativeObject);
+		XCTAssertNil([cls target]);
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 1);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 1);
+}
+
+- (void)testInitializerReturningSelf {
+	TestInitOwnershipResetCounters();
+	HyperloopClass *cls = nil;
+	__weak id weakNative = nil;
+	@autoreleasepool {
+		cls = [[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:YES init:@selector(initWithValue:) args:@[@42]];
+		XCTAssertTrue([cls.nativeObject isKindOfClass:[TestInitOwnershipMock class]]);
+		weakNative = cls.nativeObject;
+		HyperloopPointer *value = [HyperloopUtils invokeSelector:@selector(value) args:nil target:cls instance:YES];
+		XCTAssertEqualObjects(value, @42);
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 1);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 0);
+	XCTAssertNotNil(weakNative);
+	@autoreleasepool {
+		cls = nil;
+	}
+	XCTAssertNil(weakNative);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 1);
+}
+
+- (void)testInitializerReturningReplacement {
+	TestInitOwnershipResetCounters();
+	HyperloopClass *cls = nil;
+	__weak id weakNative = nil;
+	@autoreleasepool {
+		cls = [[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:YES init:@selector(initReturningReplacement) args:nil];
+		XCTAssertTrue([cls.nativeObject isKindOfClass:[TestInitReplacement class]]);
+		weakNative = cls.nativeObject;
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 1);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 1);
+	XCTAssertEqual(TestInitReplacementAllocs, 1);
+	XCTAssertEqual(TestInitReplacementDeallocs, 0);
+	XCTAssertNotNil(weakNative);
+	@autoreleasepool {
+		cls = nil;
+	}
+	XCTAssertNil(weakNative);
+	XCTAssertEqual(TestInitReplacementDeallocs, 1);
+}
+
+- (void)testInitializerThrowing {
+	TestInitOwnershipResetCounters();
+	@autoreleasepool {
+		XCTAssertThrowsSpecificNamed([[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:YES init:@selector(initThrowing) args:nil], NSException, @"TestInitFailure");
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 1);
+	// Only guards against over-release: the allocation currently leaks on this path
+	// (0 deallocs) because ARC does not release references during exception unwinding.
+	XCTAssertLessThanOrEqual(TestInitOwnershipDeallocs, 1);
+}
+
+- (void)testOrdinaryMethodReturningNil {
+	TestInitOwnershipResetCounters();
+	HyperloopClass *cls = nil;
+	@autoreleasepool {
+		cls = [[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:YES init:@selector(initWithValue:) args:@[@1]];
+		id result = [HyperloopUtils invokeSelector:@selector(nilObject) args:nil target:cls instance:YES];
+		XCTAssertNil(result);
+	}
+	XCTAssertEqual(TestInitOwnershipDeallocs, 0);
+	XCTAssertNotNil(cls.nativeObject);
+	@autoreleasepool {
+		cls = nil;
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 1);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 1);
+}
+
+- (void)testClassFactoryReturningNil {
+	TestInitOwnershipResetCounters();
+	@autoreleasepool {
+		HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestInitOwnershipMock" alloc:NO init:@selector(nilFactory) args:nil];
+		XCTAssertNotNil(cls);
+		XCTAssertNil(cls.nativeObject);
+	}
+	XCTAssertEqual(TestInitOwnershipAllocs, 0);
+	XCTAssertEqual(TestInitOwnershipDeallocs, 0);
+}
+
+- (void)testRegularExpressionInitializerFailure {
+	__weak id weakNative = nil;
+	@autoreleasepool {
+		// NSNull marshals to a nil NSError ** so no out-parameter storage is involved.
+		HyperloopClass *invalid = [[HyperloopClass alloc] initWithClassName:@"NSRegularExpression" alloc:YES init:@selector(initWithPattern:options:error:) args:@[@"(", @0, [NSNull null]]];
+		XCTAssertNotNil(invalid);
+		XCTAssertNil(invalid.nativeObject);
+
+		HyperloopClass *valid = [[HyperloopClass alloc] initWithClassName:@"NSRegularExpression" alloc:YES init:@selector(initWithPattern:options:error:) args:@[@"a+", @0, [NSNull null]]];
+		XCTAssertTrue([valid.nativeObject isKindOfClass:[NSRegularExpression class]]);
+		XCTAssertEqualObjects([(NSRegularExpression *)valid.nativeObject pattern], @"a+");
+		weakNative = valid.nativeObject;
+	}
+	XCTAssertNil(weakNative);
 }
 
 
