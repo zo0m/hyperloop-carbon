@@ -4,6 +4,7 @@
  */
 
 #import <XCTest/XCTest.h>
+#import <objc/runtime.h>
 #import "pointer.h"
 #import "class.h"
 #import "utils.h"
@@ -586,6 +587,215 @@ static int testObjectDealloc = 0;
 		t = nil;
 	}
 	XCTAssertEqual(testObjectDealloc, 1);
+}
+
+/**
+ * The backing storage a pointer wrapper owns, read through the private _storage ivar so tests can
+ * observe its lifetime with weak references. nil when the wrapper owns none. Throws (failing the
+ * test) when the ivar is absent, so ownership assertions cannot pass vacuously.
+ */
+static NSMutableData *ownedStorage(HyperloopPointer *p) {
+	Ivar ivar = class_getInstanceVariable([HyperloopPointer class], "_storage");
+	if (!ivar) {
+		@throw [NSException exceptionWithName:NSInternalInconsistencyException reason:@"HyperloopPointer has no _storage ivar" userInfo:nil];
+	}
+	return object_getIvar(p, ivar);
+}
+
+// Hyperloop.createPointer('^i') path (+encoding:): the zeroed buffer behind pointerValue must
+// stay valid after the autorelease pool around its creation drains (heap-use-after-free under ASan
+// when it is not owned by the wrapper).
+- (void)testCreatedPointerStorageOutlivesAutoreleasePool {
+	__weak NSMutableData *weakStorage = nil;
+	HyperloopPointer *p = nil;
+	@autoreleasepool {
+		p = [HyperloopPointer encoding:@encode(int *)];
+	}
+	@autoreleasepool {
+		int *slot = (int *)[p pointerValue];
+		XCTAssertTrue(slot != NULL);
+		XCTAssertEqual(*slot, 0);
+		*slot = 42;
+		XCTAssertEqual([[p valueAtIndex:0] intValue], 42);
+		weakStorage = ownedStorage(p);
+		XCTAssertNotNil(weakStorage);
+		XCTAssertEqual([weakStorage mutableBytes], (void *)slot);
+	}
+	@autoreleasepool {
+		p = nil;
+	}
+	XCTAssertNil(weakStorage);
+}
+
+// pointer:encoding: copies the pointee bytes into wrapper storage (it does not alias the source);
+// that copy must survive the pool around the wrapper's creation.
+- (void)testCopiedPointerStorageOutlivesAutoreleasePool {
+	double source = 1.5;
+	__weak NSMutableData *weakStorage = nil;
+	HyperloopPointer *p = nil;
+	@autoreleasepool {
+		p = [HyperloopPointer pointer:&source encoding:@encode(double *)];
+	}
+	@autoreleasepool {
+		double *slot = (double *)[p pointerValue];
+		XCTAssertTrue(slot != &source);
+		XCTAssertEqual(*slot, 1.5);
+		*slot = 2.5;
+		XCTAssertEqual([[p valueAtIndex:0] doubleValue], 2.5);
+		XCTAssertEqual(source, 1.5);
+		weakStorage = ownedStorage(p);
+		XCTAssertNotNil(weakStorage);
+	}
+	@autoreleasepool {
+		p = nil;
+	}
+	XCTAssertNil(weakStorage);
+}
+
+// Generated block / custom-class callback arguments of pointer type, e.g. BOOL *stop. The wrapper
+// stores a copy of the pointer slot (&arg), and the JS -> native conversion reads the slot back.
+// The callback's pool drains while JS may still hold the wrapper; the slot must remain readable for
+// the callback scope. The native stack address itself is only valid during the callback.
+- (void)testGeneratedPointerArgumentSurvivesAutoreleasePool {
+	NSArray *items = @[@1, @2, @3];
+	__block NSUInteger visited = 0;
+	__block HyperloopPointer *heldArgument = nil;
+	[items enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL *arg2) {
+		visited++;
+		@autoreleasepool {
+			// emitted by hooks/generate/util.js getObjCReturnResult for a 'pointer' argument
+			// (block.js generateBlockWrapper, custom.js) with arg = { type: 'pointer', value: 'BOOL *' }
+			id _arg2 = (arg2 == nil) ? (id)[NSNull null] : (id)[HyperloopPointer pointer:(const void *)&arg2 encoding:@encode(BOOL *)];
+			heldArgument = _arg2;
+		}
+		@autoreleasepool {
+			// emitted by hooks/generate/util.js generateObjCValue for the same argument (JS -> native)
+			BOOL * stop = *(BOOL **)[(HyperloopPointer *)heldArgument pointerValue];
+			XCTAssertEqual(stop, arg2);
+			*stop = YES;
+		}
+	}];
+	XCTAssertEqual(visited, 1);
+
+	__weak NSMutableData *weakStorage = nil;
+	@autoreleasepool {
+		weakStorage = ownedStorage(heldArgument);
+		XCTAssertNotNil(weakStorage);
+		heldArgument = nil;
+	}
+	XCTAssertNil(weakStorage);
+}
+
+// create:encoding: borrows the address: the wrapper owns no storage, reads through the caller's
+// memory and never frees it (a double free below would abort if it did).
+- (void)testBorrowedPointerIsNotOwned {
+	int *borrowed = calloc(2, sizeof(int));
+	__weak HyperloopPointer *weakPointer = nil;
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer create:borrowed encoding:@encode(int *)];
+		weakPointer = p;
+		XCTAssertEqual([p pointerValue], (void *)borrowed);
+		XCTAssertNil(ownedStorage(p));
+		borrowed[0] = 5;
+		XCTAssertEqual([[p valueAtIndex:0] intValue], 5);
+	}
+	XCTAssertNil(weakPointer);
+	borrowed[1] = 9;
+	XCTAssertEqual(borrowed[1], 9);
+	free(borrowed);
+}
+
+// setValue:atIndex: on owned storage writes in place: the address (which also keys the JS wrapper
+// table) stays stable, other elements are kept, and the storage is released with the wrapper.
+- (void)testSetValueWritesOwnedStorageInPlace {
+	__weak NSMutableData *weakStorage = nil;
+	HyperloopPointer *p = nil;
+	void *address = NULL;
+	@autoreleasepool {
+		p = [HyperloopPointer encoding:@encode(int *)];
+		weakStorage = ownedStorage(p);
+		XCTAssertNotNil(weakStorage);
+		address = [p pointerValue];
+		[p setValue:@7 atIndex:0];
+		[p setValue:@8 atIndex:1];
+		XCTAssertTrue(ownedStorage(p) == weakStorage);
+	}
+	@autoreleasepool {
+		XCTAssertNotNil(weakStorage);
+		XCTAssertEqual([p pointerValue], address);
+		XCTAssertEqual(((int *)[p pointerValue])[0], 7);
+		XCTAssertEqual(((int *)[p pointerValue])[1], 8);
+		XCTAssertEqual([[p valueAtIndex:0] intValue], 7);
+		XCTAssertEqual([[p valueAtIndex:1] intValue], 8);
+	}
+	@autoreleasepool {
+		p = nil;
+	}
+	XCTAssertNil(weakStorage);
+}
+
+// value encodings are read through the NSValue copy in _value; an in-place write must refresh it
+- (void)testSetValueWritesOwnedValueInPlace {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer encoding:@encode(int)];
+		NSMutableData *storage = ownedStorage(p);
+		XCTAssertNotNil(storage);
+		void *bytes = [storage mutableBytes];
+		[p setValue:@7 atIndex:0];
+		XCTAssertTrue(ownedStorage(p) == storage);
+		XCTAssertEqual([ownedStorage(p) mutableBytes], bytes);
+		XCTAssertEqual(*(int *)bytes, 7);
+		XCTAssertEqual([p intValue], 7);
+	}
+}
+
+// the last element that fits is writable; the first one past the storage, a negative JS index
+// (dispatch converts -1 to NSUIntegerMax) and an index whose byte offset wraps around are rejected
+// without touching the storage
+- (void)testSetValueOwnedStorageBounds {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer encoding:@encode(int *)];
+		NSMutableData *storage = ownedStorage(p);
+		int *elements = (int *)[storage mutableBytes];
+		NSUInteger count = [storage length] / sizeof(int);
+		XCTAssertTrue(count >= 1);
+		[p setValue:@7 atIndex:0];
+		[p setValue:@9 atIndex:count - 1];
+		NSData *before = [storage copy];
+
+		XCTAssertThrowsSpecificNamed([p setValue:@1 atIndex:count], NSException, @"InvalidArgument");
+		NSArray *negativeIndexArgs = @[@1, @(-1)];
+		XCTAssertThrowsSpecificNamed([HyperloopUtils invokeSelector:@selector(setValue:atIndex:) args:negativeIndexArgs target:p instance:YES], NSException, @"InvalidArgument");
+		XCTAssertThrowsSpecificNamed([p setValue:@1 atIndex:NSUIntegerMax / sizeof(int) + 1], NSException, @"InvalidArgument");
+
+		XCTAssertTrue(ownedStorage(p) == storage);
+		XCTAssertEqualObjects(storage, before);
+		XCTAssertEqual(elements[0], 7);
+		XCTAssertEqual(elements[count - 1], 9);
+	}
+}
+
+// a rejected write leaves the cached scalar value untouched
+- (void)testSetValueOutsideOwnedValueKeepsValue {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer encoding:@encode(int)];
+		[p setValue:@5 atIndex:0];
+		XCTAssertThrowsSpecificNamed([p setValue:@6 atIndex:1], NSException, @"InvalidArgument");
+		XCTAssertEqual([p intValue], 5);
+		XCTAssertEqual(*(int *)[ownedStorage(p) mutableBytes], 5);
+	}
+}
+
+// 'l' is a 4-byte element in ObjC type encodings, but the value is converted as a (64-bit) long;
+// the write must not spill into the neighbouring element
+- (void)testSetValueRejectsElementWidthMismatch {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer encoding:"^l"];
+		NSMutableData *storage = ownedStorage(p);
+		NSData *before = [storage copy];
+		XCTAssertThrowsSpecificNamed([p setValue:@1 atIndex:0], NSException, @"InvalidArgument");
+		XCTAssertEqualObjects(storage, before);
+	}
 }
 
 @end
