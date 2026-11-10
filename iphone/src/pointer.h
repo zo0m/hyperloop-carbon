@@ -92,8 +92,12 @@
 +(instancetype)pointer:(const void *)pointer encoding:(const char *)encoding framework:(NSString *)framework classname:(NSString *)classname;
 
 /**
- * create a pointer to a void * pointer type with the ObjC encoding but assign the pointer. when the object
- * is dealloc, the pointer will be free'd
+ * create a pointer with the ObjC encoding that borrows the supplied pointer. for non-struct pointer and
+ * value encodings the address is stored as-is (no copy is made), so pointerValue returns it unchanged and
+ * it is only valid while its owner keeps that storage alive. the pointer is never free'd on dealloc.
+ * as with pointer:encoding:, object, class, selector and C string encodings are wrapped or copied into
+ * their own containers, and struct (and struct pointer) encodings copy the struct bytes into storage
+ * owned by this object.
  */
 +(instancetype)create:(const void *)pointer encoding:(const char *)encoding;
 
