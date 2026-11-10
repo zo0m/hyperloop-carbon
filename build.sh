@@ -58,16 +58,6 @@ then
 	fi
 fi
 
-# Make sure xcpretty is installed
-XC=$(xcpretty --version)
-
-if [ ! $? -eq 0 ];
-then
-	echo "xcpretty not installed"
-	echo "Download by running sudo gem install xcpretty"
-	exit 1
-fi
-
 # Update our node-dependencies
 npm install
 
@@ -97,11 +87,7 @@ rm -rf libs/*
 mkdir -p ./build
 mkdir -p ./build/docs
 rm -rf dist
-ti build -p android --build-only
-if [ $? -ne 0 ];
-then
-	exit $?
-fi
+ti build -p android --build-only || exit $?
 cp dist/*.zip ../dist
 cd ..
 
@@ -121,12 +107,7 @@ cd ..
 
 rm -rf build
 rm -rf hyperloop-iphone-*.zip
-./build.sh
-
-if [ $? -ne 0 ];
-then
-	exit $?
-fi
+./build.sh || exit $?
 
 cp -R build/zip/modules/ ../dist/modules
 cd ..

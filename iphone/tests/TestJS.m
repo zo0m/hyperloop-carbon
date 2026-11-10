@@ -586,8 +586,36 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertEqualObjects([obj objectForKey:@"line"], @1);
 	XCTAssertEqualObjects([obj objectForKey:@"name"], @"InvalidArgument");
 	XCTAssertEqualObjects([obj objectForKey:@"description"], @"you must pass at least 2 arguments to dispatch");
+	XCTAssertEqualObjects([obj objectForKey:@"message"], @"you must pass at least 2 arguments to dispatch");
+	id stack = [obj objectForKey:@"stack"];
+	XCTAssertTrue([stack isKindOfClass:[NSString class]]);
+	XCTAssertTrue([stack length] > 0);
 	XCTAssertTrue([obj objectForKey:@"nativeStack"] != nil);
 	JSStringRelease(script);
+}
+
+-(void)testExceptionLikeObjectGettersEvaluatedOnce {
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString(
+		"var counts = { line: 0, column: 0 };"
+		"({ get line() { counts.line++; return 0; }, get column() { counts.column++; return 7; } })");
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue(JSValueIsObject(_ctx.context, result));
+
+	id obj = JSValueRefToId(_ctx.context, result, &exception);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue([obj isKindOfClass:[NSDictionary class]]);
+	XCTAssertEqualObjects([obj objectForKey:@"line"], @0);
+	XCTAssertEqualObjects([obj objectForKey:@"column"], @7);
+
+	script = JSStringCreateWithUTF8CString("[counts.line, counts.column]");
+	JSValueRef counts = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	id countsObj = JSValueRefToId(_ctx.context, counts, &exception);
+	XCTAssertEqualObjects(countsObj, (@[@1, @1]));
 }
 
 -(void)testStruct {

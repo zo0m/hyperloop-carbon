@@ -11,13 +11,7 @@ export TITANIUM_SDK="13.2.0.GA"
 echo "Titanium SDK version: "
 echo $TITANIUM_SDK
 
-XC=`which xcpretty`
 CHECK="✓ "
-
-if [ $? -eq 1 ];
-then
-	gem install xcpretty
-fi
 
 rm -rf build
 
@@ -28,40 +22,36 @@ if [ "${CI}" = "1" ];
 then
 	echo "Testing ..."
 	xcodebuild clean >/dev/null
-	xcodebuild -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 12' -scheme hyperloop -target Tests -configuration Debug GCC_PREPROCESSOR_DEFINITIONS='USE_JSCORE_FRAMEWORK=1' test | xcpretty -r junit
-	if [ $? -ne 0 ];
-	then
-		exit $?
-	fi
+	./test.sh || exit $?
 fi
 
 # Build the native module
 echo "\nBuilding module ..."
 mkdir -p build/zip
-ti build -p ios --build-only
-cd dist
-unzip hyperloop-iphone-$VERSION.zip -d ../build/zip
-cd ..
+ti build -p ios --build-only || exit $?
+cd dist || exit $?
+unzip hyperloop-iphone-$VERSION.zip -d ../build/zip || exit $?
+cd .. || exit $?
 
 # Package the metabase into the .zip
 echo "Packaging iOS metabase..."
-cd ../packages/hyperloop-ios-metabase
-rm *.tgz
-npm pack >/dev/null 2>&1
-cd $CWD
+cd ../packages/hyperloop-ios-metabase || exit $?
+rm -f *.tgz
+npm pack >/dev/null 2>&1 || exit $?
+cd "$CWD" || exit $?
 
 # Install dependencies
 echo "Installing npm dependencies..."
-cd build/zip/modules/iphone/hyperloop/$VERSION/hooks
-npm i --production
-npm i $CWD/../packages/hyperloop-ios-metabase/hyperloop-metabase-$METABASE_VERSION.tgz
+cd build/zip/modules/iphone/hyperloop/$VERSION/hooks || exit $?
+npm i --production || exit $?
+npm i "$CWD"/../packages/hyperloop-ios-metabase/hyperloop-metabase-$METABASE_VERSION.tgz || exit $?
 rm -rf node_modules/findit/test
 rm -rf package-lock.json
-cd $CWD
+cd "$CWD" || exit $?
 
-cd $CWD/build/zip
-rm -rf $CWD/hyperloop-iphone-$VERSION.zip
-zip -q -r $CWD/hyperloop-iphone-$VERSION.zip * --exclude=*test* --exclude=*.DS_Store* --exclude=*.git* --exclude *.travis.yml*  --exclude *.gitignore*  --exclude *.npmignore* --exclude *CHANGELOG* --exclude *.jshintrc*
+cd "$CWD"/build/zip || exit $?
+rm -rf "$CWD"/hyperloop-iphone-$VERSION.zip
+zip -q -r "$CWD"/hyperloop-iphone-$VERSION.zip * --exclude=*test* --exclude=*.DS_Store* --exclude=*.git* --exclude *.travis.yml*  --exclude *.gitignore*  --exclude *.npmignore* --exclude *CHANGELOG* --exclude *.jshintrc* || exit $?
 
 unset TITANIUM_SDK
 

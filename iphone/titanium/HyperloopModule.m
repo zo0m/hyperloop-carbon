@@ -260,6 +260,16 @@ BOOL isJSRegExp (JSContextRef ctx, JSObjectRef obj, JSValueRef *exception) {
 }
 
 /**
+ * returns true if the object has the named property, including non-enumerable ones
+ */
+static BOOL HasJSProperty (JSContextRef ctx, JSObjectRef obj, const char *name) {
+	JSStringRef prop = JSStringCreateWithUTF8CString(name);
+	BOOL result = JSObjectHasProperty(ctx, obj, prop);
+	JSStringRelease(prop);
+	return result;
+}
+
+/**
  * returns the property for the JSObjectRef as a boolean or false if not found
  */
 static BOOL TiPropToBool (JSContextRef ctx, JSObjectRef obj, const char *prop, JSValueRef *exception) {
@@ -632,15 +642,19 @@ static id JSValueRefToIdWithPath (JSContextRef ctx, const JSValueRef value, JSVa
 					[result setObject:value forKey:NSStringFromJSStringRef(ctx, name, exception)];
 				}
 				JSPropertyNameArrayRelease(props);
-				// if it looks like an exception, add the message to the output
-				// FIXME: test for constructor instead
-				if (!(exception && *exception) && [result objectForKey:@"line"] && [result objectForKey:@"column"]) {
-					const char *names[] = { "message", "stack" };
-					for (unsigned c = 0; c < 2; c++) {
+				// if it looks like an exception, add its error properties to the output;
+				// JavaScriptCore defines line, column, message and stack as non-enumerable on Error
+				if (!(exception && *exception) && HasJSProperty(ctx, obj, "line") && HasJSProperty(ctx, obj, "column")) {
+					const char *names[] = { "line", "column", "message", "stack" };
+					for (unsigned c = 0; c < 4; c++) {
+						// line/column copied by the enumeration above are not read (or their getters run) twice
+						if (c < 2 && [result objectForKey:@(names[c])] != nil) {
+							continue;
+						}
 						JSStringRef name = JSStringCreateWithUTF8CString(names[c]);
 						JSValueRef val = JSObjectGetProperty(ctx, obj, name, exception);
 						id value = nil;
-						if (!(exception && *exception)) {
+						if (!(exception && *exception) && !JSValueIsUndefined(ctx, val)) {
 							value = JSValueRefToIdWithPath(ctx, val, exception, path);
 						}
 						if (value && !(exception && *exception)) {

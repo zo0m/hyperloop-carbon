@@ -35,7 +35,15 @@ jobs:
 
     - name: Test Native Code
       working-directory: ./iphone
-      run: xcodebuild -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 12' -scheme hyperloop -target Tests -configuration Debug GCC_PREPROCESSOR_DEFINITIONS='USE_JSCORE_FRAMEWORK=1' test | xcpretty -r junit
+      run: ./test.sh
+
+    - name: Archive native test results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: native-test-results
+        if-no-files-found: warn
+        path: iphone/build/native-tests/
 
     - name: Use Node.js
       uses: actions/setup-node@v6

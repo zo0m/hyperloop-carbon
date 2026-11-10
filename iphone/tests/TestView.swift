@@ -9,7 +9,7 @@ import UIKit
 
 open class TestView : UIView {
 	
-	open func foo (_ x : CGFloat, y : CGFloat) -> CGFloat {
+	@objc open func foo (_ x : CGFloat, y : CGFloat) -> CGFloat {
 		return x + y;
 	}
 }
