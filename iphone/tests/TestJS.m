@@ -9,12 +9,102 @@
 #import "pointer.h"
 #import "class.h"
 #import "utils.h"
+#import <dlfcn.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundeclared-selector"
 
 static id KrollValue;
 static JSClassRef classDef;
+
+/*
+ * Test-only ownership tracking for the JSStringRef copies made by HyperloopModule.m, which is
+ * linked into this bundle from libhyperloop.a. The static linker binds the module's calls to these definitions
+ * instead of the JavaScriptCore exports; both forward to JavaScriptCore. While tracking is
+ * active, every non-NULL JSValueToStringCopy result must be released exactly once.
+ * trackedJSStrings counts outstanding acquisitions per address. Each acquisition is pinned by an
+ * extra JSStringRetain until tracking stops, so a tracked address cannot be reused by an unrelated
+ * JSStringRef during the interval and a release at zero outstanding is a genuine extra release.
+ */
+static CFMutableBagRef trackedJSStrings = NULL;
+static CFMutableSetRef acquiredJSStrings = NULL;
+static CFMutableArrayRef pinnedJSStrings = NULL;
+static NSUInteger trackedJSStringCopies = 0;
+static NSUInteger trackedJSStringDoubleReleases = 0;
+
+static void *JavaScriptCoreSymbol (const char *name) {
+	static void *handle = NULL;
+	if (handle == NULL) {
+		Dl_info info;
+		if (dladdr((const void *)JSStringCreateWithUTF8CString, &info) == 0 || info.dli_fname == NULL ||
+			(handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD)) == NULL) {
+			fprintf(stderr, "cannot locate the loaded JavaScriptCore image\n");
+			abort();
+		}
+	}
+	void *symbol = dlsym(handle, name);
+	if (symbol == NULL) {
+		fprintf(stderr, "cannot resolve JavaScriptCore symbol %s: %s\n", name, dlerror());
+		abort();
+	}
+	return symbol;
+}
+
+JSStringRef JSValueToStringCopy (JSContextRef ctx, JSValueRef value, JSValueRef *exception) {
+	static JSStringRef (*copy)(JSContextRef, JSValueRef, JSValueRef *) = NULL;
+	if (copy == NULL) {
+		copy = (JSStringRef (*)(JSContextRef, JSValueRef, JSValueRef *))JavaScriptCoreSymbol("JSValueToStringCopy");
+	}
+	JSStringRef string = copy(ctx, value, exception);
+	if (trackedJSStrings && string) {
+		CFBagAddValue(trackedJSStrings, string);
+		CFSetAddValue(acquiredJSStrings, string);
+		CFArrayAppendValue(pinnedJSStrings, JSStringRetain(string));
+		trackedJSStringCopies++;
+	}
+	return string;
+}
+
+void JSStringRelease (JSStringRef string) {
+	static void (*release)(JSStringRef) = NULL;
+	if (release == NULL) {
+		release = (void (*)(JSStringRef))JavaScriptCoreSymbol("JSStringRelease");
+	}
+	if (trackedJSStrings && string) {
+		if (CFBagGetCountOfValue(trackedJSStrings, string) > 0) {
+			CFBagRemoveValue(trackedJSStrings, string);
+		} else if (CFSetContainsValue(acquiredJSStrings, string)) {
+			trackedJSStringDoubleReleases++;
+		}
+	}
+	release(string);
+}
+
+static void StopTrackingJSStrings (void) {
+	if (trackedJSStrings == NULL) {
+		return;
+	}
+	CFMutableArrayRef pinned = pinnedJSStrings;
+	CFRelease(trackedJSStrings);
+	CFRelease(acquiredJSStrings);
+	trackedJSStrings = NULL;
+	acquiredJSStrings = NULL;
+	pinnedJSStrings = NULL;
+	// tracking is off, so these releases forward without being counted
+	for (CFIndex i = 0; i < CFArrayGetCount(pinned); i++) {
+		JSStringRelease((JSStringRef)CFArrayGetValueAtIndex(pinned, i));
+	}
+	CFRelease(pinned);
+}
+
+static void StartTrackingJSStrings (void) {
+	StopTrackingJSStrings();
+	trackedJSStrings = CFBagCreateMutable(NULL, 0, NULL);
+	acquiredJSStrings = CFSetCreateMutable(NULL, 0, NULL);
+	pinnedJSStrings = CFArrayCreateMutable(NULL, 0, NULL);
+	trackedJSStringCopies = 0;
+	trackedJSStringDoubleReleases = 0;
+}
 
 static NSString *NSStringFromJSValueRef (JSContextRef ctx, JSValueRef value, JSValueRef *exception) {
 	JSStringRef string = JSValueToStringCopy(ctx, value, exception);
@@ -130,6 +220,7 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 }
 
 -(void)tearDown {
+	StopTrackingJSStrings();
 	[Hyperloop willStopNewContext:_ctx bridge:_bridge];
 	JSGlobalContextRelease(_ctx.context);
 	JSContextGroupRelease(_group);
@@ -774,6 +865,105 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertTrue([obj isKindOfClass:[NSDictionary class]]);
 	XCTAssertEqualObjects(obj[@"a"], @1);
 	XCTAssertEqualObjects(obj[@"self"], [NSNull null]);
+}
+
+-(void)assertTrackedJSStringsReleasedWithMinimumCopies:(NSUInteger)minimum {
+	NSUInteger outstanding = trackedJSStrings ? (NSUInteger)CFBagGetCount(trackedJSStrings) : 0;
+	NSUInteger copies = trackedJSStringCopies;
+	NSUInteger doubleReleases = trackedJSStringDoubleReleases;
+	StopTrackingJSStrings();
+	XCTAssertGreaterThanOrEqual(copies, minimum, @"the tracked conversion path did not copy JSStringRefs");
+	XCTAssertEqual(outstanding, (NSUInteger)0, @"%lu of %lu JSStringRef copies were not released", (unsigned long)outstanding, (unsigned long)copies);
+	XCTAssertEqual(doubleReleases, (NSUInteger)0);
+}
+
+// converts a JS string in a separate context, then destroys that context before checking the NSString
+-(void)assertStringConversionOfScript:(const char *)source expected:(NSString *)expected {
+	JSGlobalContextRef ctx = JSGlobalContextCreate(NULL);
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString(source);
+	JSValueRef value = JSEvaluateScript(ctx, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	if (exception != NULL || value == NULL) {
+		XCTAssertTrue(value != NULL);
+		JSGlobalContextRelease(ctx);
+		return;
+	}
+	XCTAssertTrue(JSValueIsString(ctx, value));
+
+	id converted = nil;
+	@autoreleasepool {
+		StartTrackingJSStrings();
+		converted = JSValueRefToId(ctx, value, &exception);
+		[self assertTrackedJSStringsReleasedWithMinimumCopies:1];
+	}
+	JSGlobalContextRelease(ctx);
+
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue([converted isKindOfClass:[NSString class]]);
+	XCTAssertEqual([converted length], [expected length]);
+	XCTAssertEqualObjects(converted, expected);
+}
+
+-(void)testStringConversionReleasesJSString {
+	[self assertStringConversionOfScript:"'hello'" expected:@"hello"];
+	[self assertStringConversionOfScript:"''" expected:@""];
+	[self assertStringConversionOfScript:"'caf\\u00e9 \\u65e5\\u672c \\uD83D\\uDE00'" expected:@"café 日本 \U0001F600"];
+	XCTAssertEqual([@"\U0001F600" length], (NSUInteger)2);
+
+	NSString *longASCII = [@"" stringByPaddingToLength:524288 withString:@"abcdefgh" startingAtIndex:0];
+	[self assertStringConversionOfScript:"'abcdefgh'.repeat(65536)" expected:longASCII];
+	NSString *longUnicode = [[@"" stringByPaddingToLength:65536 withString:@"é日" startingAtIndex:0] stringByAppendingString:@"\U0001F600"];
+	[self assertStringConversionOfScript:"'\\u00e9\\u65e5'.repeat(32768) + '\\uD83D\\uDE00'" expected:longUnicode];
+}
+
+-(void)testDispatchSelectorConversionReleasesJSStrings {
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString(
+		"(function() {"
+		"  var cls = Hyperloop.createProxy({class:'TestJSExample', alloc:false, init:'class' });"
+		"  var sum = 0;"
+		"  for (var i = 0; i < 100; i++) { sum += Hyperloop.dispatch(cls, 'testInt'); }"
+		"  var fromObject = Hyperloop.dispatch(cls, { toString: function() { return 'testInt'; } });"
+		"  return [sum, fromObject];"
+		"})()");
+	StartTrackingJSStrings();
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	[self assertTrackedJSStringsReleasedWithMinimumCopies:101];
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	if (exception != NULL) {
+		return;
+	}
+	XCTAssertTrue(result != NULL);
+	if (result == NULL) {
+		return;
+	}
+	id values = JSValueRefToId(_ctx.context, result, &exception);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertEqualObjects(values, (@[@200, @2]));
+}
+
+-(void)testDispatchSelectorToStringExceptionPropagates {
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString(
+		"(function() {"
+		"  var cls = Hyperloop.createProxy({class:'TestJSExample', alloc:false, init:'class' });"
+		"  return Hyperloop.dispatch(cls, { toString: function() { throw new Error('selector failed'); } });"
+		"})()");
+	StartTrackingJSStrings();
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	[self assertTrackedJSStringsReleasedWithMinimumCopies:1];
+	JSStringRelease(script);
+	XCTAssertTrue(result == NULL);
+	XCTAssertTrue(exception != NULL);
+	if (exception == NULL) {
+		return;
+	}
+	id error = JSValueRefToId(_ctx.context, exception, NULL);
+	XCTAssertTrue([error isKindOfClass:[NSDictionary class]]);
+	XCTAssertEqualObjects([error objectForKey:@"message"], @"selector failed");
 }
 
 @end
