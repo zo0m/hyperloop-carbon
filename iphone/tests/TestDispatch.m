@@ -219,13 +219,72 @@ static void TestInitOwnershipResetCounters(void) {
 }
 @end
 
+@interface TestArrayArgumentMock : NSObject
++(void)reset;
++(id)receivedValue;
++(int)receivedBefore;
++(int)receivedAfter;
+@end
+
+typedef NS_ENUM(int, TestArrayArgumentKind) {
+	TestArrayArgumentKindNil = 0,
+	TestArrayArgumentKindEmptyArray = 1,
+	TestArrayArgumentKindNonEmptyArray = 2,
+	TestArrayArgumentKindOther = 3
+};
+
+static id TestArrayArgumentValue;
+static int TestArrayArgumentBefore;
+static int TestArrayArgumentAfter;
+
+@implementation TestArrayArgumentMock
++(void)reset {
+	TestArrayArgumentValue = nil;
+	TestArrayArgumentBefore = 0;
+	TestArrayArgumentAfter = 0;
+}
++(id)receivedValue {
+	return TestArrayArgumentValue;
+}
++(int)receivedBefore {
+	return TestArrayArgumentBefore;
+}
++(int)receivedAfter {
+	return TestArrayArgumentAfter;
+}
++(int)kindOf:(id)value {
+	if (value == nil) {
+		return TestArrayArgumentKindNil;
+	}
+	if (![value isKindOfClass:[NSArray class]]) {
+		return TestArrayArgumentKindOther;
+	}
+	return [value count] == 0 ? TestArrayArgumentKindEmptyArray : TestArrayArgumentKindNonEmptyArray;
+}
++(int)takeArray:(NSArray *)value {
+	TestArrayArgumentValue = value;
+	return [self kindOf:value];
+}
++(int)takeInt:(int)before array:(NSArray *)value int:(int)after {
+	TestArrayArgumentBefore = before;
+	TestArrayArgumentValue = value;
+	TestArrayArgumentAfter = after;
+	return [self kindOf:value];
+}
++(int)takeBlock:(void (^)(void))block {
+	TestArrayArgumentValue = block;
+	return block == nil ? TestArrayArgumentKindNil : TestArrayArgumentKindOther;
+}
+@end
+
 @implementation TestDispatch
 
-#ifdef HYPERLOOP_MEMORY_TRACKING
 -(void)tearDown {
+	[TestArrayArgumentMock reset];
+#ifdef HYPERLOOP_MEMORY_TRACKING
 	HyperloopTrackDumpAll();
-}
 #endif
+}
 
 - (void)testNoArgDispatch {
 	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"NSString" alloc:YES init:@selector(initWithString:) args:@[@"hello"]];
@@ -661,6 +720,53 @@ static void TestInitOwnershipResetCounters(void) {
 	XCTAssertNil(weakNative);
 }
 
+
+- (void)testEmptyArrayObjectArgument {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSArray *empty = @[];
+	// The outer array is the invocation argument list; the inner empty array is the one argument.
+	id result = [HyperloopUtils invokeSelector:@selector(takeArray:) args:@[empty] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindEmptyArray));
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertNotNil(received);
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
+}
+
+- (void)testEmptyArgumentListIsNotAnEmptyArrayArgument {
+	// Control: an empty argument list means zero method arguments, not one empty array.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	XCTAssertThrowsSpecificNamed([HyperloopUtils invokeSelector:@selector(takeArray:) args:@[] target:cls instance:NO], NSException, @"WrongArgumentCount");
+}
+
+- (void)testNonEmptyArrayObjectArgument {
+	// Control: unchanged non-empty conversion path.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSArray *value = @[@1, @"two", @[@3]];
+	id result = [HyperloopUtils invokeSelector:@selector(takeArray:) args:@[value] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNonEmptyArray));
+	XCTAssertEqualObjects([TestArrayArgumentMock receivedValue], value);
+}
+
+- (void)testEmptyArrayObjectArgumentBetweenScalars {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(takeInt:array:int:) args:@[@7, @[], @9] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindEmptyArray));
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertNotNil(received);
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
+	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 7);
+	XCTAssertEqual([TestArrayArgumentMock receivedAfter], 9);
+}
+
+- (void)testEmptyArrayBlockArgumentStaysNil {
+	// Control: a block parameter (@?) is not an array parameter; [] keeps arriving as nil.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(takeBlock:) args:@[@[]] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNil));
+	XCTAssertNil([TestArrayArgumentMock receivedValue]);
+}
 
 @end
 

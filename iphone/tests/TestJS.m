@@ -104,6 +104,15 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 }
 @end
 
+// Fixture defined in TestDispatch.m. Its selectors return 0 for nil, 1 for a non-nil
+// empty NSArray, 2 for a non-empty NSArray and 3 for any other object.
+@interface TestArrayArgumentMock : NSObject
++(void)reset;
++(id)receivedValue;
++(int)receivedBefore;
++(int)receivedAfter;
+@end
+
 @interface TestJS : XCTestCase
 
 @property (nonatomic, retain) KrollContext *ctx;
@@ -127,6 +136,7 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 }
 
 -(void)tearDown {
+	[TestArrayArgumentMock reset];
 	[Hyperloop willStopNewContext:_ctx bridge:_bridge];
 	JSGlobalContextRelease(_ctx.context);
 	JSContextGroupRelease(_group);
@@ -747,6 +757,74 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertTrue([obj isKindOfClass:[NSDictionary class]]);
 	XCTAssertEqualObjects(obj[@"a"], @1);
 	XCTAssertEqualObjects(obj[@"self"], [NSNull null]);
+}
+
+
+// Evaluates Hyperloop.dispatch(TestArrayArgumentMock, selector, args) and returns the reported kind, or -1 on failure.
+-(int)dispatchArrayFixture:(NSString *)selector args:(NSString *)args {
+	[TestArrayArgumentMock reset];
+	NSString *source = [NSString stringWithFormat:@"(function() { var c = Hyperloop.createProxy({class:'TestArrayArgumentMock', alloc:false, init:'class', args:null}); return Hyperloop.dispatch(c, '%@', %@, false); })()", selector, args];
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString([source UTF8String]);
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	if (exception != NULL) {
+		return -1;
+	}
+	XCTAssertTrue(result != NULL);
+	if (result == NULL) {
+		return -1;
+	}
+	XCTAssertTrue(JSValueIsNumber(_ctx.context, result));
+	if (!JSValueIsNumber(_ctx.context, result)) {
+		return -1;
+	}
+	return (int)JSValueToNumber(_ctx.context, result, NULL);
+}
+
+-(void)testDispatchEmptyJSArrayArgument {
+	XCTAssertEqual([self dispatchArrayFixture:@"takeArray:" args:@"[[]]"], 1);
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertNotNil(received);
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
+}
+
+-(void)testDispatchNonEmptyJSArrayArgument {
+	// Control: unchanged non-empty conversion path.
+	XCTAssertEqual([self dispatchArrayFixture:@"takeArray:" args:@"[[1, 'two', [3]]]"], 2);
+	id check = @[@1, @"two", @[@3]];
+	XCTAssertEqualObjects([TestArrayArgumentMock receivedValue], check);
+}
+
+-(void)testDispatchNullObjectArgument {
+	// Control: unchanged null path; JS null still arrives as nil.
+	XCTAssertEqual([self dispatchArrayFixture:@"takeArray:" args:@"[null]"], 0);
+	XCTAssertNil([TestArrayArgumentMock receivedValue]);
+}
+
+-(void)testDispatchNestedEmptyJSArrayArgument {
+	XCTAssertEqual([self dispatchArrayFixture:@"takeArray:" args:@"[[[]]]"], 2);
+	NSArray *received = [TestArrayArgumentMock receivedValue];
+	XCTAssertEqual([received count], 1);
+	if ([received count] != 1) {
+		return;
+	}
+	id inner = received[0];
+	XCTAssertNotNil(inner);
+	XCTAssertTrue([inner isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([inner count], 0);
+}
+
+-(void)testDispatchEmptyJSArrayArgumentBetweenScalars {
+	XCTAssertEqual([self dispatchArrayFixture:@"takeInt:array:int:" args:@"[7, [], 9]"], 1);
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertNotNil(received);
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
+	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 7);
+	XCTAssertEqual([TestArrayArgumentMock receivedAfter], 9);
 }
 
 @end
