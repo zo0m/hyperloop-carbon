@@ -458,6 +458,19 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertEqualObjects(obj, @"123");
 }
 
+// the typed JS accessors convert a pointer's stored value into the requested type
+-(void)testConvertPointerValueBetweenTypes {
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString("(function() {var d = Hyperloop.createPointer('d'); Hyperloop.dispatch(d, 'setValue:atIndex:', [-3.75, 0]); var i = Hyperloop.createPointer('i'); Hyperloop.dispatch(i, 'setValue:atIndex:', [123, 0]); return [Hyperloop.intValue(d), Hyperloop.boolValue(d), Hyperloop.doubleValue(d), Hyperloop.doubleValue(i), Hyperloop.floatValue(i)] })()");
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	XCTAssertTrue(exception == NULL);
+	JSStringRelease(script);
+	id obj = JSValueRefToId(_ctx.context, result, &exception);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue([obj isKindOfClass:[NSArray class]]);
+	XCTAssertEqualObjects(obj, (@[@-3, @YES, @-3.75, @123, @123]));
+}
+
 -(void)testJSStringAsString {
 	JSValueRef exception = NULL;
 	JSStringRef script = JSStringCreateWithUTF8CString("Hyperloop.stringValue('hello')");

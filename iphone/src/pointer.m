@@ -588,11 +588,133 @@ NSString *cleanEncoding (NSString *encoding) {
 	return [[HyperloopPointer alloc] initWithPointer:[zeroed bytes] encoding:encoding assign:NO framework:nil classname:nil];
 }
 
-#define GETVALUE(type, name, def) \
+/**
+ * a numeric value as stored, widened without loss into the field for its kind
+ */
+typedef struct {
+	enum { HLNumberSigned, HLNumberUnsigned, HLNumberFloating } kind;
+	long long s;
+	unsigned long long u;
+	double d;
+} HLStoredNumber;
+
+/**
+ * decode the numeric scalar the value is stored as, reading exactly the bytes of its encoding (which
+ * can differ from the similarly named C type: 'l' and 'L' are 4 bytes). returns NO when the value is
+ * not a numeric scalar (pointer, struct, array, object, class, selector, C string or no value)
+ */
+static BOOL HLReadStoredNumber(HyperloopValue *value, HLStoredNumber *number) {
+	NSObject *object = [value getObject];
+	if (![object isKindOfClass:[NSValue class]]) {
+		return NO;
+	}
+	NSValue *stored = (NSValue *)object;
+	const char *encoding = [stored objCType];
+	encoding += strspn(encoding, "rnNoORV");
+	if (encoding[0] == '\0' || encoding[1] != '\0') {
+		return NO;
+	}
+	switch (encoding[0]) {
+		case 'f': {
+			float f = 0;
+			[stored getValue:&f size:sizeof(f)];
+			number->kind = HLNumberFloating;
+			number->d = f;
+			return YES;
+		}
+		case 'd': {
+			number->kind = HLNumberFloating;
+			[stored getValue:&number->d size:sizeof(number->d)];
+			return YES;
+		}
+		case 'c': case 's': case 'i': case 'l': case 'q':
+		case 'C': case 'S': case 'I': case 'L': case 'Q': case 'B':
+			break;
+		default:
+			return NO;
+	}
+	BOOL isSigned = islower(encoding[0]);
+	NSUInteger size = 0;
+	NSGetSizeAndAlignment(encoding, &size, NULL);
+	number->kind = isSigned ? HLNumberSigned : HLNumberUnsigned;
+	switch (size) {
+#define HL_READ_INTEGER(bits) \
+		case sizeof(int##bits##_t): {\
+			if (isSigned) {\
+				int##bits##_t v = 0;\
+				[stored getValue:&v size:sizeof(v)];\
+				number->s = v;\
+			} else {\
+				uint##bits##_t v = 0;\
+				[stored getValue:&v size:sizeof(v)];\
+				number->u = v;\
+			}\
+			return YES;\
+		}
+		HL_READ_INTEGER(8)
+		HL_READ_INTEGER(16)
+		HL_READ_INTEGER(32)
+		HL_READ_INTEGER(64)
+#undef HL_READ_INTEGER
+		default:
+			return NO;
+	}
+}
+
+/**
+ * integer destinations.
+ * integers: in-range values are preserved; to an unsigned destination they reduce modulo 2^N. an
+ * out-of-range value to a signed destination is implementation-defined in C; Clang (like GCC, which
+ * documents it) reduces it modulo 2^N as well, which is the behavior relied on here.
+ * floating values: NaN converts to 0 and finite values truncate toward zero, saturating to the
+ * destination's limits where the truncated value is out of range (and the C conversion undefined), so
+ * negative values give 0 for unsigned destinations. min is 0 or -2^(N-1) and exact as a double; (double)max
+ * is exact up to 32 bits and rounds up to max + 1 (2^63 or 2^64) for 64-bit types, so every value that
+ * passes both guards truncates into [min, max]
+ */
+#define HL_TO_INTEGER(type, min, max, n) \
+	((n).kind == HLNumberSigned ? (type)(n).s : \
+	 (n).kind == HLNumberUnsigned ? (type)(n).u : \
+	 isnan((n).d) ? (type)0 : \
+	 (n).d <= (double)(min) ? (type)(min) : \
+	 (n).d >= (double)(max) ? (type)(max) : (type)(n).d)
+
+#define HL_TO_FLOATING(type, n) \
+	((n).kind == HLNumberSigned ? (type)(n).s : (n).kind == HLNumberUnsigned ? (type)(n).u : (type)(n).d)
+
+/**
+ * double to float: finite values beyond the float range, where the C conversion is undefined, become the
+ * infinity of their sign; NaN stays NaN and infinities stay infinite without being cast, and in-range values
+ * (including signed zero) are cast as is
+ */
+static float HLDoubleToFloat(double d) {
+	if (isnan(d)) {
+		return NAN;
+	}
+	if (d > FLT_MAX) {
+		return INFINITY;
+	}
+	if (d < -FLT_MAX) {
+		return -INFINITY;
+	}
+	return (float)d;
+}
+
+// C semantics: zero is false, anything else (including NaN) is true
+#define HL_TO_BOOL(n) \
+	((n).kind == HLNumberSigned ? (n).s != 0 : (n).kind == HLNumberUnsigned ? (n).u != 0 : (n).d != 0)
+
+/**
+ * typed numeric accessors convert the stored numeric value into the requested type and return def when
+ * the value is not a numeric scalar
+ */
+#define GETVALUE(type, name, def, convert) \
 -(type)name##Value { \
-	type v = def; \
-	[_value getValue:&v];\
-	return v;\
+	HLStoredNumber n = { HLNumberSigned, 0, 0, 0 }; \
+	if (!HLReadStoredNumber(_value, &n)) {\
+		return def;\
+	}\
+	return convert;\
 }\
 \
 +(type)name##Value:(id) value{\
@@ -609,19 +731,19 @@ NSString *cleanEncoding (NSString *encoding) {
 	return fmt(v);\
 }\
 
-GETVALUE(float, float, 0.0f);
-GETVALUE(int, int, 0);
-GETVALUE(long, long, 0);
-GETVALUE(short, short, 0);
-GETVALUE(double, double, 0);
-GETVALUE(char, char, '\0');
-GETVALUE(bool, bool, false);
-GETVALUE(long long, longLong, 0);
-GETVALUE(unsigned int, unsignedInt, 0);
-GETVALUE(unsigned long, unsignedLong, 0);
-GETVALUE(unsigned long long, unsignedLongLong, 0);
-GETVALUE(unsigned short, unsignedShort, 0);
-GETVALUE(unsigned char, unsignedChar, '\0');
+GETVALUE(float, float, 0.0f, n.kind == HLNumberFloating ? HLDoubleToFloat(n.d) : HL_TO_FLOATING(float, n));
+GETVALUE(int, int, 0, HL_TO_INTEGER(int, INT_MIN, INT_MAX, n));
+GETVALUE(long, long, 0, HL_TO_INTEGER(long, LONG_MIN, LONG_MAX, n));
+GETVALUE(short, short, 0, HL_TO_INTEGER(short, SHRT_MIN, SHRT_MAX, n));
+GETVALUE(double, double, 0, HL_TO_FLOATING(double, n));
+GETVALUE(char, char, '\0', HL_TO_INTEGER(char, CHAR_MIN, CHAR_MAX, n));
+GETVALUE(bool, bool, false, HL_TO_BOOL(n));
+GETVALUE(long long, longLong, 0, HL_TO_INTEGER(long long, LLONG_MIN, LLONG_MAX, n));
+GETVALUE(unsigned int, unsignedInt, 0, HL_TO_INTEGER(unsigned int, 0, UINT_MAX, n));
+GETVALUE(unsigned long, unsignedLong, 0, HL_TO_INTEGER(unsigned long, 0, ULONG_MAX, n));
+GETVALUE(unsigned long long, unsignedLongLong, 0, HL_TO_INTEGER(unsigned long long, 0, ULLONG_MAX, n));
+GETVALUE(unsigned short, unsignedShort, 0, HL_TO_INTEGER(unsigned short, 0, USHRT_MAX, n));
+GETVALUE(unsigned char, unsignedChar, '\0', HL_TO_INTEGER(unsigned char, 0, UCHAR_MAX, n));
 GETVALUEFMT(NSString *, SEL, selector, nil, NSStringFromSelector);
 
 -(void *)pointerValue {

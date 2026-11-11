@@ -935,6 +935,424 @@ static NSMutableData *ownedStorage(HyperloopPointer *p) {
 	}
 }
 
+#pragma mark - typed numeric accessors
+
+// typed accessors convert the stored value into the requested type instead of copying the stored bytes
+- (void)testDoubleConvertsToInt {
+	@autoreleasepool {
+		double d = 3.0;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] intValue], 3);
+		d = 2.75;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] intValue], 2);
+		d = -2.75;
+		HyperloopPointer *p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p intValue], -2);
+		XCTAssertEqual([p shortValue], -2);
+		XCTAssertEqual([p charValue], -2);
+		XCTAssertEqual([p longLongValue], -2);
+		XCTAssertEqual([HyperloopPointer intValue:p], -2);
+	}
+}
+
+- (void)testSmallIntegerWidensToWiderType {
+	@autoreleasepool {
+		signed char c = -5;
+		HyperloopPointer *p = [HyperloopPointer pointer:&c encoding:@encode(signed char)];
+		XCTAssertEqual([p intValue], -5);
+		XCTAssertEqual([p longLongValue], -5);
+		XCTAssertEqual([p doubleValue], -5.0);
+
+		short s = -1;
+		p = [HyperloopPointer pointer:&s encoding:@encode(short)];
+		XCTAssertEqual([p intValue], -1);
+		XCTAssertEqual([p longValue], -1);
+
+		unsigned char uc = 200;
+		p = [HyperloopPointer pointer:&uc encoding:@encode(unsigned char)];
+		XCTAssertEqual([p intValue], 200);
+		XCTAssertEqual([p longLongValue], 200);
+
+		unsigned int ui = 4000000000u;
+		p = [HyperloopPointer pointer:&ui encoding:@encode(unsigned int)];
+		XCTAssertEqual([p longLongValue], 4000000000LL);
+		XCTAssertEqual([p unsignedLongLongValue], 4000000000ULL);
+		XCTAssertEqual([p doubleValue], 4000000000.0);
+	}
+}
+
+// explicit 'l'/'L' encodings are 4 bytes, unlike the 8 byte C long they are named after
+- (void)testFourByteLongEncodingConvertsToLong {
+	@autoreleasepool {
+		NSUInteger size = 0;
+		NSGetSizeAndAlignment("l", &size, NULL);
+		XCTAssertEqual(size, sizeof(int32_t));
+
+		int32_t l = -7;
+		HyperloopPointer *p = [HyperloopPointer pointer:&l encoding:"l"];
+		XCTAssertEqual([p longValue], -7L);
+		XCTAssertEqual([p intValue], -7);
+
+		uint32_t ul = UINT32_MAX;
+		p = [HyperloopPointer pointer:&ul encoding:"L"];
+		XCTAssertEqual([p unsignedLongValue], (unsigned long)UINT32_MAX);
+		XCTAssertEqual([p longLongValue], (long long)UINT32_MAX);
+	}
+}
+
+- (void)testIntegerConvertsToFloatingPoint {
+	@autoreleasepool {
+		int i = 7;
+		HyperloopPointer *p = [HyperloopPointer pointer:&i encoding:@encode(int)];
+		XCTAssertEqual([p doubleValue], 7.0);
+		XCTAssertEqual([p floatValue], 7.0f);
+
+		i = -3;
+		p = [HyperloopPointer pointer:&i encoding:@encode(int)];
+		XCTAssertEqual([p doubleValue], -3.0);
+
+		float f = 1.1f;
+		p = [HyperloopPointer pointer:&f encoding:@encode(float)];
+		// float widens to double exactly; it does not round to the nearest double of 1.1
+		XCTAssertEqual([p doubleValue], (double)1.1f);
+		XCTAssertEqualWithAccuracy([p doubleValue], 1.1, 1e-6);
+
+		double d = 0.1;
+		p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p floatValue], 0.1f);
+	}
+}
+
+// 64-bit integers keep their value above 2^53 instead of being rounded through a double
+- (void)testSixtyFourBitIntegersArePreserved {
+	@autoreleasepool {
+		long long ll = (1LL << 53) + 1;
+		HyperloopPointer *p = [HyperloopPointer pointer:&ll encoding:@encode(long long)];
+		XCTAssertEqual([p longLongValue], ll);
+		XCTAssertEqual([p longValue], (long)ll);
+		XCTAssertEqual([p unsignedLongLongValue], (unsigned long long)ll);
+
+		unsigned long long ull = (1ULL << 63) + 5;
+		p = [HyperloopPointer pointer:&ull encoding:@encode(unsigned long long)];
+		XCTAssertEqual([p unsignedLongLongValue], ull);
+		XCTAssertEqual([p unsignedLongValue], (unsigned long)ull);
+		XCTAssertEqual([p doubleValue], 9223372036854775808.0);
+
+		ll = -1;
+		p = [HyperloopPointer pointer:&ll encoding:@encode(long long)];
+		XCTAssertEqual([p unsignedLongLongValue], ULLONG_MAX);
+	}
+}
+
+// integer narrowing keeps the low-order bits, as a C conversion does
+- (void)testIntegerNarrowingWraps {
+	@autoreleasepool {
+		int i = 0x12345;
+		HyperloopPointer *p = [HyperloopPointer pointer:&i encoding:@encode(int)];
+		XCTAssertEqual([p shortValue], (short)0x2345);
+		XCTAssertEqual([p unsignedCharValue], 0x45);
+
+		long long ll = -1;
+		p = [HyperloopPointer pointer:&ll encoding:@encode(long long)];
+		XCTAssertEqual([p unsignedIntValue], UINT_MAX);
+		XCTAssertEqual([p intValue], -1);
+	}
+}
+
+- (void)testBoolConversions {
+	@autoreleasepool {
+		double d = 0.0;
+		XCTAssertFalse([[HyperloopPointer pointer:&d encoding:@encode(double)] boolValue]);
+		d = 0.25;
+		XCTAssertTrue([[HyperloopPointer pointer:&d encoding:@encode(double)] boolValue]);
+		d = -1.0;
+		XCTAssertTrue([[HyperloopPointer pointer:&d encoding:@encode(double)] boolValue]);
+
+		int i = 0;
+		XCTAssertFalse([[HyperloopPointer pointer:&i encoding:@encode(int)] boolValue]);
+		i = 256;
+		XCTAssertTrue([[HyperloopPointer pointer:&i encoding:@encode(int)] boolValue]);
+
+		bool b = true;
+		HyperloopPointer *p = [HyperloopPointer pointer:&b encoding:@encode(bool)];
+		XCTAssertEqual([p doubleValue], 1.0);
+		XCTAssertEqual([p longLongValue], 1);
+	}
+}
+
+// floating values truncate toward zero; NaN converts to 0 and values beyond the destination range
+// saturate to its limits, where a C conversion would be undefined
+- (void)testFloatingToIntegerBoundaries {
+	@autoreleasepool {
+		double d = 1e20;
+		HyperloopPointer *p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p intValue], INT_MAX);
+		XCTAssertEqual([p longLongValue], LLONG_MAX);
+		XCTAssertEqual([p unsignedLongLongValue], ULLONG_MAX);
+		XCTAssertEqual([p charValue], CHAR_MAX);
+
+		d = -1e20;
+		p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p intValue], INT_MIN);
+		XCTAssertEqual([p longLongValue], LLONG_MIN);
+		XCTAssertEqual([p unsignedIntValue], 0u);
+
+		d = 2147483648.0;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] intValue], INT_MAX);
+		d = -2147483648.0;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] intValue], INT_MIN);
+		d = 9223372036854775808.0;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] longLongValue], LLONG_MAX);
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] unsignedLongLongValue], 9223372036854775808ULL);
+
+		d = -0.5;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] unsignedIntValue], 0u);
+		d = -1.0;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] unsignedIntValue], 0u);
+
+		d = INFINITY;
+		p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p intValue], INT_MAX);
+		XCTAssertTrue([p boolValue]);
+		XCTAssertEqual([p floatValue], INFINITY);
+		d = -INFINITY;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] intValue], INT_MIN);
+
+		d = NAN;
+		p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		XCTAssertEqual([p intValue], 0);
+		XCTAssertEqual([p unsignedLongLongValue], 0ull);
+		XCTAssertTrue([p boolValue]);
+		XCTAssertTrue(isnan([p floatValue]));
+
+		float f = 3e9f;
+		XCTAssertEqual([[HyperloopPointer pointer:&f encoding:@encode(float)] intValue], INT_MAX);
+		XCTAssertEqual([[HyperloopPointer pointer:&f encoding:@encode(float)] unsignedIntValue], 3000000000u);
+	}
+}
+
+// finite doubles beyond the float range become the infinity of their sign; everything else converts as is
+- (void)testDoubleToFloatOverflow {
+	@autoreleasepool {
+		double d = FLT_MAX;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], FLT_MAX);
+		d = -FLT_MAX;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], -FLT_MAX);
+		d = nextafter((double)FLT_MAX, INFINITY);
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], INFINITY);
+		d = nextafter(-(double)FLT_MAX, -INFINITY);
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], -INFINITY);
+		d = 1e300;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], INFINITY);
+		d = -1e300;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], -INFINITY);
+
+		d = INFINITY;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], INFINITY);
+		d = -INFINITY;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], -INFINITY);
+		d = NAN;
+		XCTAssertTrue(isnan([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue]));
+
+		d = 0.0;
+		float zero = [[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue];
+		XCTAssertEqual(zero, 0.0f);
+		XCTAssertFalse(signbit(zero));
+		d = -0.0;
+		float negativeZero = [[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue];
+		XCTAssertEqual(negativeZero, 0.0f);
+		XCTAssertTrue(signbit(negativeZero));
+
+		d = -2.5;
+		XCTAssertEqual([[HyperloopPointer pointer:&d encoding:@encode(double)] floatValue], -2.5f);
+	}
+}
+
+static HyperloopPointer *doublePointer(double d) {
+	return [HyperloopPointer pointer:&d encoding:@encode(double)];
+}
+
+static HyperloopPointer *floatPointer(float f) {
+	return [HyperloopPointer pointer:&f encoding:@encode(float)];
+}
+
+// exact conversion limits and their neighbouring representable values: (double)LLONG_MAX and
+// (double)ULLONG_MAX round up to 2^63 and 2^64, which are themselves out of range
+- (void)testFloatingToIntegerExactLimits {
+	@autoreleasepool {
+		XCTAssertEqual([doublePointer(0x1p63) longLongValue], LLONG_MAX);
+		XCTAssertEqual([doublePointer(nextafter(0x1p63, 0)) longLongValue], 9223372036854774784LL);
+		XCTAssertEqual([doublePointer(-0x1p63) longLongValue], LLONG_MIN);
+		XCTAssertEqual([doublePointer(nextafter(-0x1p63, 0)) longLongValue], -9223372036854774784LL);
+		XCTAssertEqual([doublePointer(nextafter(-0x1p63, -INFINITY)) longLongValue], LLONG_MIN);
+
+		XCTAssertEqual([doublePointer(0x1p64) unsignedLongLongValue], ULLONG_MAX);
+		XCTAssertEqual([doublePointer(nextafter(0x1p64, 0)) unsignedLongLongValue], 18446744073709549568ULL);
+		XCTAssertEqual([doublePointer(nextafter(0x1p64, INFINITY)) unsignedLongLongValue], ULLONG_MAX);
+		XCTAssertEqual([doublePointer(0x1p63) unsignedLongLongValue], 9223372036854775808ULL);
+
+		XCTAssertEqual([doublePointer(2147483647.0) intValue], INT_MAX);
+		XCTAssertEqual([doublePointer(nextafter(2147483647.0, 0)) intValue], 2147483646);
+		XCTAssertEqual([doublePointer(2147483647.75) intValue], INT_MAX);
+		XCTAssertEqual([doublePointer(nextafter(0x1p31, INFINITY)) intValue], INT_MAX);
+		XCTAssertEqual([doublePointer(-2147483648.0) intValue], INT_MIN);
+		XCTAssertEqual([doublePointer(nextafter(-2147483648.0, 0)) intValue], -2147483647);
+		XCTAssertEqual([doublePointer(-2147483648.75) intValue], INT_MIN);
+		XCTAssertEqual([doublePointer(-2147483649.0) intValue], INT_MIN);
+
+		XCTAssertEqual([doublePointer(4294967295.0) unsignedIntValue], UINT_MAX);
+		XCTAssertEqual([doublePointer(nextafter(0x1p32, 0)) unsignedIntValue], UINT_MAX);
+		XCTAssertEqual([doublePointer(0x1p32) unsignedIntValue], UINT_MAX);
+		XCTAssertEqual([doublePointer(-0.0) unsignedIntValue], 0u);
+		XCTAssertEqual([doublePointer(nextafter(0.0, -1.0)) unsignedIntValue], 0u);
+		XCTAssertEqual([doublePointer(-0.75) unsignedLongLongValue], 0ull);
+		XCTAssertEqual([doublePointer(-INFINITY) unsignedLongLongValue], 0ull);
+		XCTAssertEqual([doublePointer(INFINITY) unsignedLongLongValue], ULLONG_MAX);
+		XCTAssertEqual([doublePointer(INFINITY) longLongValue], LLONG_MAX);
+		XCTAssertEqual([doublePointer(-INFINITY) longLongValue], LLONG_MIN);
+
+		// float sources widen to double exactly before the same checks
+		XCTAssertEqual([floatPointer(nextafterf(0x1p31f, 0)) intValue], 2147483520);
+		XCTAssertEqual([floatPointer(0x1p31f) intValue], INT_MAX);
+		XCTAssertEqual([floatPointer(nextafterf(0x1p63f, 0)) longLongValue], 9223371487098961920LL);
+		XCTAssertEqual([floatPointer(0x1p63f) longLongValue], LLONG_MAX);
+		XCTAssertEqual([floatPointer(-0x1p63f) longLongValue], LLONG_MIN);
+		XCTAssertEqual([floatPointer(nextafterf(0x1p64f, 0)) unsignedLongLongValue], 18446742974197923840ULL);
+		XCTAssertEqual([floatPointer(0x1p64f) unsignedLongLongValue], ULLONG_MAX);
+		XCTAssertEqual([floatPointer(-1.0f) unsignedLongLongValue], 0ull);
+		XCTAssertEqual([floatPointer(NAN) longLongValue], 0LL);
+		XCTAssertEqual([floatPointer(-INFINITY) intValue], INT_MIN);
+	}
+}
+
+// signed and unsigned crossings: unsigned destinations reduce modulo 2^N; out-of-range signed
+// destinations rely on Clang reducing modulo 2^N as well
+- (void)testIntegerSignednessCrossings {
+	@autoreleasepool {
+		int i = -1;
+		HyperloopPointer *p = [HyperloopPointer pointer:&i encoding:@encode(int)];
+		XCTAssertEqual([p unsignedShortValue], USHRT_MAX);
+		XCTAssertEqual([p unsignedLongLongValue], ULLONG_MAX);
+
+		short s = -2;
+		p = [HyperloopPointer pointer:&s encoding:@encode(short)];
+		XCTAssertEqual([p unsignedIntValue], UINT_MAX - 1);
+
+		unsigned short us = USHRT_MAX;
+		p = [HyperloopPointer pointer:&us encoding:@encode(unsigned short)];
+		XCTAssertEqual([p intValue], 65535);
+
+		unsigned int ui = UINT_MAX;
+		p = [HyperloopPointer pointer:&ui encoding:@encode(unsigned int)];
+		XCTAssertEqual([p intValue], -1);
+
+		i = 0x18000;
+		p = [HyperloopPointer pointer:&i encoding:@encode(int)];
+		XCTAssertEqual([p shortValue], SHRT_MIN);
+
+		unsigned long long ull = (1ULL << 63) + 5;
+		p = [HyperloopPointer pointer:&ull encoding:@encode(unsigned long long)];
+		XCTAssertEqual([p longLongValue], LLONG_MIN + 5);
+	}
+}
+
+// an object-backed NSNumber converts like the scalar it holds; other objects have no numeric value
+- (void)testObjectBackedNumberConverts {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer pointer:(__bridge void *)@42 encoding:@encode(id)];
+		XCTAssertEqual([p intValue], 42);
+		XCTAssertEqual([p doubleValue], 42.0);
+
+		p = [HyperloopPointer pointer:(__bridge void *)@2.5 encoding:@encode(id)];
+		XCTAssertEqual([p intValue], 2);
+		XCTAssertEqual([p doubleValue], 2.5);
+
+		p = [HyperloopPointer pointer:(__bridge void *)@(LLONG_MAX) encoding:@encode(id)];
+		XCTAssertEqual([p longLongValue], LLONG_MAX);
+
+		p = [HyperloopPointer pointer:(__bridge void *)@YES encoding:@encode(id)];
+		XCTAssertTrue([p boolValue]);
+		XCTAssertEqual([p intValue], 1);
+
+		p = [HyperloopPointer pointer:(__bridge void *)[NSValue valueWithCGPoint:CGPointMake(3, 4)] encoding:@encode(id)];
+		XCTAssertEqual([p intValue], 0);
+
+		p = [HyperloopPointer pointer:(__bridge void *)@"42" encoding:@encode(id)];
+		XCTAssertEqual([p intValue], 0);
+	}
+}
+
+// type qualifiers left on the stored encoding do not change how the value is decoded
+- (void)testQualifiedEncodingConverts {
+	@autoreleasepool {
+		int i = -9;
+		HyperloopPointer *p = [HyperloopPointer pointer:&i encoding:"rni"];
+		XCTAssertEqual([p intValue], -9);
+		XCTAssertEqual([p longLongValue], -9);
+		XCTAssertEqual([p doubleValue], -9.0);
+	}
+}
+
+// storage that is not a numeric scalar has no numeric value; the accessors return their default
+// rather than copying its bytes into the result
+- (void)testNonNumericStorageReturnsDefault {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer create:NULL encoding:"^i"];
+		XCTAssertEqual([p intValue], 0);
+		XCTAssertEqual([p doubleValue], 0.0);
+
+		const char *str = "a string longer than eight bytes";
+		p = [HyperloopPointer pointer:str encoding:@encode(char *)];
+		XCTAssertEqual([p intValue], 0);
+		XCTAssertEqual([p longLongValue], 0);
+		XCTAssertEqualObjects([p stringValue], @"a string longer than eight bytes");
+
+		SEL sel = @selector(description);
+		p = [HyperloopPointer pointer:sel encoding:@encode(SEL)];
+		XCTAssertEqual([p intValue], 0);
+		XCTAssertEqualObjects([p selectorValue], @"description");
+
+		CGPoint pt = CGPointMake(1, 2);
+		p = [HyperloopPointer pointer:&pt encoding:@encode(CGPoint)];
+		XCTAssertEqual([p intValue], 0);
+	}
+}
+
+// a numeric HyperloopPointer assigned into another pointer's element is converted to the element type
+- (void)testSetValueConvertsPointerValueToElementType {
+	@autoreleasepool {
+		double d = 4.5;
+		HyperloopPointer *source = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		HyperloopPointer *p = [HyperloopPointer encoding:@encode(int)];
+		[p setValue:source atIndex:0];
+		XCTAssertEqual([p intValue], 4);
+		XCTAssertEqual(*(int *)[ownedStorage(p) mutableBytes], 4);
+	}
+}
+
+// raw extraction still copies the stored bytes in their own encoding, and only those bytes
+- (void)testRawValueExtractionKeepsStoredEncoding {
+	@autoreleasepool {
+		double d = -2.75;
+		HyperloopPointer *p = [HyperloopPointer pointer:&d encoding:@encode(double)];
+		double raw = 0;
+		[[p value] getValue:&raw];
+		XCTAssertEqual(memcmp(&raw, &d, sizeof(d)), 0);
+		double element = 0;
+		[p getValue:0 pointer:&element];
+		XCTAssertEqual(element, d);
+
+		int32_t l = -7;
+		p = [HyperloopPointer pointer:&l encoding:"l"];
+		XCTAssertEqual([p length], sizeof(int32_t));
+		struct { int32_t value; uint8_t canary[4]; } dest = { 0, { 0xA5, 0xA5, 0xA5, 0xA5 } };
+		[[p value] getValue:&dest.value];
+		XCTAssertEqual(dest.value, -7);
+		for (int i = 0; i < 4; i++) {
+			XCTAssertEqual(dest.canary[i], 0xA5);
+		}
+	}
+}
+
 @end
 
 #pragma clang diagnostic pop
