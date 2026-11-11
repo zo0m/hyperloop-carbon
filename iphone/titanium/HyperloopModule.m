@@ -986,9 +986,7 @@ JS_CALLBACK_END
 JS_CALLBACK(Logger)
 	NSMutableArray *array = [NSMutableArray arrayWithCapacity:argumentCount];
 	for (size_t c = 0; c < argumentCount; c++) {
-		JSStringRef s = JSValueToStringCopy(ctx, arguments[c], exception);
-		CHECKEXCEPTION
-		NSString *str = NSStringFromJSStringRef(ctx, s, exception);
+		NSString *str = NSStringFromJSValueRef(ctx, arguments[c], exception);
 		CHECKEXCEPTION
 		[array addObject:str];
 	}

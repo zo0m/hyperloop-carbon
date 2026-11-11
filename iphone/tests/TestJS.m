@@ -10,6 +10,7 @@
 #import "class.h"
 #import "utils.h"
 #import <dlfcn.h>
+#import <fcntl.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundeclared-selector"
@@ -1105,6 +1106,210 @@ static int TestJSReceivedTrailing;
 	XCTAssertEqual([received count], 0);
 	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 7);
 	XCTAssertEqual([TestArrayArgumentMock receivedAfter], 9);
+}
+
+-(JSValueRef)evaluateUntrackedScript:(const char *)source {
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString(source);
+	JSValueRef value = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL, @"untracked script threw");
+	XCTAssertTrue(value != NULL);
+	return exception == NULL ? value : NULL;
+}
+
+-(NSString *)stringFromUntrackedScript:(const char *)source {
+	JSValueRef value = [self evaluateUntrackedScript:source];
+	XCTAssertTrue(value != NULL && JSValueIsString(_ctx.context, value));
+	if (value == NULL || !JSValueIsString(_ctx.context, value)) {
+		return nil;
+	}
+	return NSStringFromJSValueRef(_ctx.context, value, NULL);
+}
+
+/*
+ * Returns the messages NSLog wrote to `output` from the thread that logged `marker`, without the
+ * "date process[pid:tid] " prefix, or nil when the marker is missing because NSLog does not copy
+ * its output to stderr in this environment. Filtering by the marker's [pid:tid] keeps lines logged
+ * by other threads out of the result.
+ */
+static NSArray<NSString *> *LoggedMessagesOfMarkerThread (NSString *output, NSString *marker) {
+	NSArray<NSString *> *lines = [output componentsSeparatedByString:@"\n"];
+	NSUInteger markerIndex = [lines indexOfObjectPassingTest:^BOOL(NSString *line, NSUInteger idx, BOOL *stop) {
+		return [line hasSuffix:marker];
+	}];
+	if (markerIndex == NSNotFound) {
+		return nil;
+	}
+	NSRegularExpression *threadPattern = [NSRegularExpression regularExpressionWithPattern:@"\\[[0-9]+:[0-9A-Fa-fx]+\\]" options:0 error:NULL];
+	NSString *markerLine = lines[markerIndex];
+	NSTextCheckingResult *match = [threadPattern firstMatchInString:markerLine options:0 range:NSMakeRange(0, markerLine.length)];
+	if (match == nil) {
+		return nil;
+	}
+	NSString *thread = [markerLine substringWithRange:match.range];
+
+	NSMutableArray *messages = [NSMutableArray array];
+	for (NSUInteger i = 0; i < lines.count; i++) {
+		NSRange range = [lines[i] rangeOfString:thread];
+		if (i == markerIndex || range.location == NSNotFound) {
+			continue;
+		}
+		NSString *message = [lines[i] substringFromIndex:NSMaxRange(range)];
+		[messages addObject:[message hasPrefix:@" "] ? [message substringFromIndex:1] : message];
+	}
+	return messages;
+}
+
+// the "[INFO]" messages among `messages`; NSLog's stderr copy drops trailing whitespace (an
+// empty Logger message was observed as "[INFO]"), so the separating space is optional
+static NSArray<NSString *> *LoggedInfoMessages (NSArray<NSString *> *messages) {
+	NSMutableArray *info = [NSMutableArray array];
+	for (NSString *message in messages) {
+		if ([message hasPrefix:@"[INFO]"]) {
+			NSString *text = [message substringFromIndex:[@"[INFO]" length]];
+			[info addObject:[text hasPrefix:@" "] ? [text substringFromIndex:1] : text];
+		}
+	}
+	return info;
+}
+
+/*
+ * Evaluates a Hyperloop.log call with JSStringRef tracking active and stderr redirected to a
+ * temporary file. Setup belongs in evaluateUntrackedScript: so only the call itself is tracked.
+ * Asserts that every JSValueToStringCopy acquisition made during the call is released exactly
+ * once and reports how many were made through `copies`. `messages` receives this thread's NSLog
+ * messages (see LoggedMessagesOfMarkerThread), or nil when NSLog output is not observable.
+ */
+-(JSValueRef)evaluateLoggerCall:(const char *)source copies:(NSUInteger *)copies messages:(NSArray<NSString *> **)messages exception:(JSValueRef *)exception {
+	*copies = 0;
+	*messages = nil;
+	NSString *marker = [NSString stringWithFormat:@"logger-capture-%@", [[NSUUID UUID] UUIDString]];
+	NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:marker];
+	int capture = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	fflush(stderr);
+	int saved = dup(STDERR_FILENO);
+	if (capture < 0 || saved < 0 || dup2(capture, STDERR_FILENO) < 0) {
+		XCTFail(@"cannot redirect stderr: %s", strerror(errno));
+		if (saved >= 0) {
+			close(saved);
+		}
+		if (capture >= 0) {
+			close(capture);
+			unlink(path.fileSystemRepresentation);
+		}
+		return NULL;
+	}
+
+	JSStringRef script = JSStringCreateWithUTF8CString(source);
+	NSLog(@"%@", marker);
+	StartTrackingJSStrings();
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, exception);
+	*copies = trackedJSStringCopies;
+
+	fflush(stderr);
+	int restored = dup2(saved, STDERR_FILENO);
+	int restoreErrno = errno;
+	close(saved);
+	close(capture);
+	XCTAssertTrue(restored >= 0, @"cannot restore stderr: %s", strerror(restoreErrno));
+
+	[self assertTrackedJSStringsReleasedWithMinimumCopies:0];
+	JSStringRelease(script);
+
+	NSString *output = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+	unlink(path.fileSystemRepresentation);
+	XCTAssertNotNil(output, @"cannot read captured stderr");
+	*messages = LoggedMessagesOfMarkerThread(output, marker);
+	return result;
+}
+
+#define SKIP_UNLESS_NSLOG_OBSERVABLE(messages) \
+	XCTSkipIf((messages) == nil, @"NSLog does not copy its output to stderr here; JSStringRef ownership was verified, log output was not")
+
+-(void)testLoggerReleasesJSStringForSingleArgument {
+	JSValueRef exception = NULL;
+	NSUInteger copies = 0;
+	NSArray *messages = nil;
+	JSValueRef result = [self evaluateLoggerCall:"Hyperloop.log('hello')" copies:&copies messages:&messages exception:&exception];
+	XCTAssertEqual(copies, (NSUInteger)1);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue(result != NULL && JSValueIsNull(_ctx.context, result));
+	SKIP_UNLESS_NSLOG_OBSERVABLE(messages);
+	XCTAssertEqualObjects(LoggedInfoMessages(messages), @[@"hello"]);
+}
+
+-(void)testLoggerReleasesJSStringsForMultipleArguments {
+	if ([self evaluateUntrackedScript:
+		"var loggerCalls = [];"
+		"var loggerObject = { toString: function() { loggerCalls.push('object'); return 'object value'; } };"] == NULL) {
+		return;
+	}
+	JSValueRef exception = NULL;
+	NSUInteger copies = 0;
+	NSArray *messages = nil;
+	JSValueRef result = [self evaluateLoggerCall:"Hyperloop.log('first', 42, 1.5, loggerObject, 'last')" copies:&copies messages:&messages exception:&exception];
+	XCTAssertEqual(copies, (NSUInteger)5);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue(result != NULL && JSValueIsNull(_ctx.context, result));
+	XCTAssertEqualObjects([self stringFromUntrackedScript:"loggerCalls.join(',')"], @"object");
+	SKIP_UNLESS_NSLOG_OBSERVABLE(messages);
+	XCTAssertEqualObjects(LoggedInfoMessages(messages), @[@"first 42 1.5 object value last"]);
+}
+
+-(void)testLoggerReleasesEmptyAndUnicodeJSStrings {
+	JSValueRef exception = NULL;
+	NSUInteger copies = 0;
+	NSArray *messages = nil;
+	JSValueRef result = [self evaluateLoggerCall:"Hyperloop.log('', 'caf\\u00e9 \\u65e5\\u672c \\uD83D\\uDE00', '', 'end')" copies:&copies messages:&messages exception:&exception];
+	XCTAssertEqual(copies, (NSUInteger)4);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue(result != NULL && JSValueIsNull(_ctx.context, result));
+	SKIP_UNLESS_NSLOG_OBSERVABLE(messages);
+	XCTAssertEqualObjects(LoggedInfoMessages(messages), @[@" café 日本 \U0001F600  end"]);
+}
+
+-(void)testLoggerWithoutArgumentsMakesNoJSStringCopies {
+	// Control: no arguments, no conversions; unchanged by the fix.
+	JSValueRef exception = NULL;
+	NSUInteger copies = 0;
+	NSArray *messages = nil;
+	JSValueRef result = [self evaluateLoggerCall:"Hyperloop.log()" copies:&copies messages:&messages exception:&exception];
+	XCTAssertEqual(copies, (NSUInteger)0);
+	XCTAssertTrue(exception == NULL);
+	XCTAssertTrue(result != NULL && JSValueIsNull(_ctx.context, result));
+	SKIP_UNLESS_NSLOG_OBSERVABLE(messages);
+	XCTAssertEqualObjects(LoggedInfoMessages(messages), @[@""]);
+}
+
+-(void)testLoggerToStringExceptionReleasesEarlierJSStrings {
+	if ([self evaluateUntrackedScript:
+		"var loggerCalls = [];"
+		"var loggerBefore = { toString: function() { loggerCalls.push('before'); return 'before'; } };"
+		"var loggerThrows = { toString: function() { loggerCalls.push('throws'); throw new Error('log failed'); } };"
+		"var loggerAfter = { toString: function() { loggerCalls.push('after'); return 'after'; } };"] == NULL) {
+		return;
+	}
+	JSValueRef exception = NULL;
+	NSUInteger copies = 0;
+	NSArray *messages = nil;
+	JSValueRef result = [self evaluateLoggerCall:"Hyperloop.log(loggerBefore, loggerThrows, loggerAfter)" copies:&copies messages:&messages exception:&exception];
+	// at least the copy of loggerBefore; converting the pending exception for the error log may copy more
+	XCTAssertGreaterThanOrEqual(copies, (NSUInteger)1);
+	XCTAssertTrue(result == NULL);
+	XCTAssertTrue(exception != NULL);
+	XCTAssertEqualObjects([self stringFromUntrackedScript:"loggerCalls.join(',')"], @"before,throws");
+	if (exception != NULL) {
+		id error = JSValueRefToId(_ctx.context, exception, NULL);
+		XCTAssertTrue([error isKindOfClass:[NSDictionary class]]);
+		XCTAssertEqualObjects([error objectForKey:@"message"], @"log failed");
+	}
+	SKIP_UNLESS_NSLOG_OBSERVABLE(messages);
+	XCTAssertEqualObjects(LoggedInfoMessages(messages), @[]);
+	NSUInteger errors = [messages indexesOfObjectsPassingTest:^BOOL(NSString *message, NSUInteger idx, BOOL *stop) {
+		return [message hasPrefix:@"[ERROR] JS Exception detected"];
+	}].count;
+	XCTAssertEqual(errors, (NSUInteger)1);
 }
 
 // Evaluates Hyperloop.dispatch(TestArrayArgumentMock, selector, args), catching in JS, and returns
