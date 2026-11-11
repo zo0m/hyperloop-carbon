@@ -82,7 +82,14 @@
 
 
 /**
- * create a pointer to a void * pointer type with the ObjC encoding
+ * create a pointer that copies the value at the supplied address into storage owned by this object.
+ * for value and pointer encodings, pointer is the address of a value of the encoded type and that
+ * type's size is copied from it. for a pointer encoding such as ^i it is the address of an int *
+ * (a pointer slot, as generated bindings pass &arg), not of the int it points to; pointerValue then
+ * returns the address of the copied slot. to wrap a native int * itself, use create:encoding:.
+ * for these encodings a NULL pointer zero-fills the storage. object, class, selector and C string
+ * encodings take the value itself. struct and struct pointer (^{...}) encodings are not slots: both
+ * copy the struct bytes from pointer, which must not be NULL.
  */
 +(instancetype)pointer:(const void *)pointer encoding:(const char *)encoding;
 
