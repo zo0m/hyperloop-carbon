@@ -138,6 +138,7 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 				SETVALUE('q', long long, longLongValue);
 				SETVALUE('B', bool, boolValue);
 				SETVALUE('Q', unsigned long long, unsignedLongLongValue);
+				SETVALUE('I', unsigned int, unsignedIntValue);
 				SETVALUE('S', unsigned short, unsignedShortValue);
 				SETVALUE('L', unsigned long, unsignedLongValue);
 				SETVALUE('C', unsigned char, unsignedCharValue);
