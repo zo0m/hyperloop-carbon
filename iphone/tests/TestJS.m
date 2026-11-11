@@ -204,6 +204,7 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 +(id)receivedValue;
 +(int)receivedBefore;
 +(int)receivedAfter;
++(int)enteredCount;
 @end
 
 @interface TestJS : XCTestCase
@@ -1041,6 +1042,78 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	XCTAssertEqual([received count], 0);
 	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 7);
 	XCTAssertEqual([TestArrayArgumentMock receivedAfter], 9);
+}
+
+// Evaluates Hyperloop.dispatch(TestArrayArgumentMock, selector, args), catching in JS, and returns
+// "error|<name>|<message>" for a thrown Error, "result|<value>" otherwise, or nil when evaluation fails.
+-(NSString *)dispatchArrayFixtureOutcome:(NSString *)selector args:(NSString *)args {
+	[TestArrayArgumentMock reset];
+	NSString *source = [NSString stringWithFormat:@"(function() { var c = Hyperloop.createProxy({class:'TestArrayArgumentMock', alloc:false, init:'class', args:null}); try { return 'result|' + Hyperloop.dispatch(c, '%@', %@, false); } catch (e) { return (e instanceof Error ? 'error|' + e.name + '|' + e.message : 'thrown|' + e); } })()", selector, args];
+	JSValueRef exception = NULL;
+	JSStringRef script = JSStringCreateWithUTF8CString([source UTF8String]);
+	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+	JSStringRelease(script);
+	XCTAssertTrue(exception == NULL);
+	if (exception != NULL || result == NULL || !JSValueIsString(_ctx.context, result)) {
+		XCTFail(@"dispatch of %@ did not produce an outcome string", selector);
+		return nil;
+	}
+	return JSValueRefToId(_ctx.context, result, NULL);
+}
+
+-(void)testDispatchEmptyJSArrayToIntThrows {
+	NSString *outcome = [self dispatchArrayFixtureOutcome:@"takeIntValue:" args:@"[[]]"];
+	XCTAssertTrue([outcome hasPrefix:@"error|InvalidArgumentType|cannot convert argument type for ["], @"%@", outcome);
+	XCTAssertTrue([outcome hasSuffix:@"at argument 0 (i)"], @"%@", outcome);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0);
+}
+
+-(void)testDispatchEmptyJSArrayToClassThrows {
+	NSString *outcome = [self dispatchArrayFixtureOutcome:@"takeClassValue:" args:@"[[]]"];
+	XCTAssertTrue([outcome hasPrefix:@"error|InvalidArgumentType|"], @"%@", outcome);
+	XCTAssertTrue([outcome hasSuffix:@"at argument 0 (#)"], @"%@", outcome);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0);
+}
+
+-(void)testDispatchJSArraysToPointerThrow {
+	for (NSString *args in @[@"[[]]", @"[[1, 2]]"]) {
+		NSString *outcome = [self dispatchArrayFixtureOutcome:@"takePointer:" args:args];
+		XCTAssertTrue([outcome hasPrefix:@"error|InvalidArgumentType|"], @"%@: %@", args, outcome);
+		XCTAssertTrue([outcome hasSuffix:@"at argument 0 (^v)"], @"%@: %@", args, outcome);
+		XCTAssertEqual([TestArrayArgumentMock enteredCount], 0, @"%@", args);
+	}
+}
+
+-(void)testDispatchNonEmptyJSArrayToBlockThrows {
+	NSString *outcome = [self dispatchArrayFixtureOutcome:@"takeBlockValue:" args:@"[[1, 2]]"];
+	XCTAssertTrue([outcome hasPrefix:@"error|InvalidArgumentType|cannot convert argument type for ["], @"%@", outcome);
+	XCTAssertTrue([outcome hasSuffix:@"at argument 0 (@?)"], @"%@", outcome);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0);
+}
+
+-(void)testDispatchEmptyJSArrayToBlockStaysNil {
+	// Unchanged compatibility control: [] to a block parameter still arrives as nil.
+	XCTAssertEqualObjects([self dispatchArrayFixtureOutcome:@"takeBlockValue:" args:@"[[]]"], @"result|0");
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 1);
+}
+
+-(void)testDispatchNullToBlockStaysNil {
+	// Control: JS null to a block parameter still arrives as nil.
+	XCTAssertEqualObjects([self dispatchArrayFixtureOutcome:@"takeBlockValue:" args:@"[null]"], @"result|0");
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 1);
+}
+
+-(void)testDispatchNullToPointerStillAccepted {
+	// Control: JS null to a pointer parameter is unaffected and arrives as NULL.
+	XCTAssertEqualObjects([self dispatchArrayFixtureOutcome:@"takePointer:" args:@"[null]"], @"result|0");
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 1);
+}
+
+-(void)testDispatchEmptyJSArrayToQualifiedObjectArgument {
+	XCTAssertEqualObjects([self dispatchArrayFixtureOutcome:@"takeQualifiedArray:" args:@"[[]]"], @"result|1");
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
 }
 
 @end

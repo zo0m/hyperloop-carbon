@@ -46,6 +46,19 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 			return [NSNull null];
 		}
 	} else if ([arg isKindOfClass:[NSArray class]]) {
+		const char *type = NULL;
+		if (invocation) {
+			// An array can only be passed as an object argument; a block parameter (@?) accepts
+			// only an empty array, which leaves it nil. Skip every leading qualifier: the
+			// runtime encodes `in bycopy id` as "nO@".
+			type = [[invocation methodSignature] getArgumentTypeAtIndex:index];
+			while (*type && strchr("rnNoORV", *type)) {
+				type++;
+			}
+			if (type[0] != '@' || (type[1] == '?' && [arg count] > 0)) {
+				@throw [NSException exceptionWithName:@"InvalidArgumentType" reason:[NSString stringWithFormat:@"cannot convert argument type for [%@] at argument %lu (%s)", [arg class], (unsigned long)index - 2, type] userInfo:nil];
+			}
+		}
 		if ([arg count] > 0) {
 			NSMutableArray *copy = [NSMutableArray arrayWithArray:arg];
 			for (NSUInteger index = 0; index < [copy count]; index++) {
@@ -58,9 +71,8 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 				return copy;
 			}
 		} else if (invocation) {
-			// Only object parameters (not blocks, @?) receive the empty array; other encodings keep their existing handling.
-			const char *type = [cleanEncoding([NSString stringWithUTF8String:[[invocation methodSignature] getArgumentTypeAtIndex:index]]) UTF8String];
-			if (type[0] == '@' && type[1] != '?') {
+			// Only object parameters receive the empty array; a block parameter (@?) is not given it.
+			if (type[1] != '?') {
 				NSMutableArray *copy = [NSMutableArray arrayWithArray:arg];
 				[invocation setArgument:&copy atIndex:index];
 			}
