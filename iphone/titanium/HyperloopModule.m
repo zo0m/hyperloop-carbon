@@ -231,7 +231,11 @@ static NSString* NSStringFromJSStringRef (JSContextRef ctx, JSStringRef string, 
  */
 static NSString* NSStringFromJSValueRef (JSContextRef ctx, JSValueRef value, JSValueRef *exception) {
 	JSStringRef string = JSValueToStringCopy(ctx, value, exception);
-	return NSStringFromJSStringRef(ctx, string, exception);
+	NSString *result = NSStringFromJSStringRef(ctx, string, exception);
+	if (string) {
+		JSStringRelease(string);
+	}
+	return result;
 }
 
 /**
