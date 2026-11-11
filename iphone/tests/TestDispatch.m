@@ -129,6 +129,29 @@ static SEL TestPointerReturnBytePointerSelector(void) {
 }
 
 /**
+ * Owns a single 4-byte int and returns it through a const-qualified pointer (encoded r^i).
+ */
+@interface TestQualifiedPointerReturnMock : NSObject
+@property (nonatomic, readonly) int *storage;
+@end
+
+@implementation TestQualifiedPointerReturnMock
+-(instancetype)init {
+	if (self = [super init]) {
+		_storage = malloc(sizeof(int));
+		*_storage = 4242;
+	}
+	return self;
+}
+-(const int *)constIntPointer {
+	return _storage;
+}
+-(void)dealloc {
+	free(_storage);
+}
+@end
+
+/**
  * Counts allocations and deallocations so tests can check that the bridge
  * neither leaks nor over-releases instances it constructs. Initializers follow
  * ARC init-family conventions: they consume self and return +1.
@@ -341,6 +364,26 @@ static void TestInitOwnershipResetCounters(void) {
 		result = nil;
 	}
 	XCTAssertNil(weakResult);
+}
+
+// a const-qualified pointer return (r^i) goes through the real signature parser: it is borrowed,
+// keeps the native address of the 4-byte pointee, drops the qualifier and is not freed on cleanup
+- (void)testQualifiedIntPointerResultIsBorrowed {
+	TestQualifiedPointerReturnMock *mock = [[TestQualifiedPointerReturnMock alloc] init];
+	XCTAssertEqual(strcmp([[mock methodSignatureForSelector:@selector(constIntPointer)] methodReturnType], "r^i"), 0);
+	__weak HyperloopPointer *weakResult = nil;
+	@autoreleasepool {
+		HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(constIntPointer) args:nil target:mock instance:YES];
+		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqualObjects([result encoding], @"^i");
+		XCTAssertEqual([result pointerValue], (void *)mock.storage);
+		XCTAssertEqual([[result valueAtIndex:0] intValue], 4242);
+		weakResult = result;
+		result = nil;
+	}
+	XCTAssertNil(weakResult);
+	// still owned (and later freed) by the mock
+	XCTAssertEqual(*mock.storage, 4242);
 }
 
 - (void)testWithIntValue {

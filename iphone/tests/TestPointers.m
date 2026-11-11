@@ -80,11 +80,15 @@ static int testObjectDealloc = 0;
 	}
 }
 
+// wraps a native int * that addresses a single 4-byte int. create:encoding: takes that address (as
+// dispatch does for pointer returns); pointer:encoding: would instead copy a pointer-sized slot from
+// it, reading 8 bytes from the 4-byte int.
 - (void)testPointerIntStar {
 	@autoreleasepool {
 		int i = 123;
 		int *ip = &i;
-		HyperloopPointer *p = [HyperloopPointer pointer:ip encoding:@encode(int *)];
+		HyperloopPointer *p = [HyperloopPointer create:ip encoding:@encode(int *)];
+		XCTAssertEqual([p pointerValue], (void *)ip);
 		id result = [p valueAtIndex:0];
 		XCTAssertTrue([result isKindOfClass:[HyperloopPointer class]]);
 		XCTAssertEqualObjects([result description], @"123");
@@ -795,6 +799,139 @@ static NSMutableData *ownedStorage(HyperloopPointer *p) {
 		NSData *before = [storage copy];
 		XCTAssertThrowsSpecificNamed([p setValue:@1 atIndex:0], NSException, @"InvalidArgument");
 		XCTAssertEqualObjects(storage, before);
+	}
+}
+
+// pointer:encoding: with a pointer encoding copies a pointer slot: the argument is the address of a
+// T * (as generated bindings pass &arg), never the T it points to. The copy is sizeof(T *) bytes read
+// from the slot, so the pointee (a single 4-byte int here) is not read by the constructor.
+- (void)testCopiedPointerEncodingCopiesPointerSlot {
+	int *ip = malloc(sizeof(int));
+	*ip = 123;
+	@autoreleasepool {
+		int *slot = ip;
+		HyperloopPointer *p = [HyperloopPointer pointer:&slot encoding:@encode(int *)];
+		NSMutableData *storage = ownedStorage(p);
+		XCTAssertNotNil(storage);
+		XCTAssertEqual([storage length], sizeof(int *));
+		XCTAssertTrue([p pointerValue] != (void *)&slot);
+		// the slot was copied: clearing the source slot does not change the wrapped address
+		slot = NULL;
+		int *extracted = *(int **)[p pointerValue];
+		XCTAssertEqual(extracted, ip);
+		XCTAssertEqual(*extracted, 123);
+	}
+	XCTAssertEqual(*ip, 123);
+	free(ip);
+}
+
+// the slot copy must not depend on the pointee being pointer-sized: 1, 2 and 8 byte pointees, each in
+// an allocation of exactly that size, keep their full native address through the generated pattern
+// (pointer:&slot encoding:@encode(T *) then *(T **)pointerValue) and are read in bounds when borrowed
+- (void)testPointerSlotAndBorrowAcrossPointeeWidths {
+	BOOL *b = malloc(sizeof(BOOL));
+	short *s = malloc(sizeof(short));
+	double *d = malloc(sizeof(double));
+	*b = YES;
+	*s = -1234;
+	*d = 2.75;
+	@autoreleasepool {
+		HyperloopPointer *pb = [HyperloopPointer pointer:(const void *)&b encoding:@encode(BOOL *)];
+		HyperloopPointer *ps = [HyperloopPointer pointer:(const void *)&s encoding:@encode(short *)];
+		HyperloopPointer *pd = [HyperloopPointer pointer:(const void *)&d encoding:@encode(double *)];
+		XCTAssertEqual(*(BOOL **)[pb pointerValue], b);
+		XCTAssertEqual(*(short **)[ps pointerValue], s);
+		XCTAssertEqual(*(double **)[pd pointerValue], d);
+		XCTAssertEqual(**(BOOL **)[pb pointerValue], YES);
+		XCTAssertEqual(**(short **)[ps pointerValue], -1234);
+		XCTAssertEqual(**(double **)[pd pointerValue], 2.75);
+
+		HyperloopPointer *bb = [HyperloopPointer create:b encoding:@encode(BOOL *)];
+		HyperloopPointer *bs = [HyperloopPointer create:s encoding:@encode(short *)];
+		HyperloopPointer *bd = [HyperloopPointer create:d encoding:@encode(double *)];
+		XCTAssertEqual([bb pointerValue], (void *)b);
+		XCTAssertEqual([bs pointerValue], (void *)s);
+		XCTAssertEqual([bd pointerValue], (void *)d);
+		XCTAssertEqual([[bb valueAtIndex:0] boolValue], YES);
+		XCTAssertEqual([[bs valueAtIndex:0] shortValue], -1234);
+		XCTAssertEqual([[bd valueAtIndex:0] doubleValue], 2.75);
+		XCTAssertNil(ownedStorage(bb));
+		XCTAssertNil(ownedStorage(bs));
+		XCTAssertNil(ownedStorage(bd));
+	}
+	// borrowed pointees are untouched and still owned (freed) by the caller
+	XCTAssertEqual(*b, YES);
+	XCTAssertEqual(*s, -1234);
+	XCTAssertEqual(*d, 2.75);
+	free(b);
+	free(s);
+	free(d);
+}
+
+// ^^i keeps both levels: a slot copy of an int ** yields the int ** back, and a borrowed int ** is the
+// native address itself, whose element is the int *
+- (void)testPointerToPointerKeepsIndirection {
+	int *ip = malloc(sizeof(int));
+	*ip = 77;
+	int **pp = malloc(sizeof(int *));
+	*pp = ip;
+	@autoreleasepool {
+		HyperloopPointer *slot = [HyperloopPointer pointer:(const void *)&pp encoding:@encode(int **)];
+		XCTAssertEqualObjects([slot encoding], @"^^i");
+		XCTAssertEqual([ownedStorage(slot) length], sizeof(int **));
+		XCTAssertEqual(*(int ***)[slot pointerValue], pp);
+		XCTAssertEqual(**(int ***)[slot pointerValue], ip);
+		XCTAssertEqual(***(int ***)[slot pointerValue], 77);
+
+		HyperloopPointer *borrowed = [HyperloopPointer create:pp encoding:@encode(int **)];
+		XCTAssertEqual([borrowed pointerValue], (void *)pp);
+		XCTAssertEqual(*(int **)[borrowed pointerValue], ip);
+		XCTAssertNil(ownedStorage(borrowed));
+		// element 0 is the int *, carried as a copied pointer slot
+		HyperloopPointer *element = [borrowed valueAtIndex:0];
+		XCTAssertTrue([element isKindOfClass:[HyperloopPointer class]]);
+		XCTAssertEqual(*(int **)[element pointerValue], ip);
+	}
+	XCTAssertEqual(*pp, ip);
+	XCTAssertEqual(*ip, 77);
+	free(pp);
+	free(ip);
+}
+
+// a const-qualified pointer encoding (r^i) is the same pointer slot: the qualifier is stripped from
+// the wrapper's encoding and the copy is still sizeof(const int *)
+- (void)testQualifiedPointerEncodingCopiesPointerSlot {
+	XCTAssertEqual(strcmp(@encode(const int *), "r^i"), 0);
+	int *ip = malloc(sizeof(int));
+	*ip = 31;
+	const int *cip = ip;
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer pointer:(const void *)&cip encoding:@encode(const int *)];
+		XCTAssertEqualObjects([p encoding], @"^i");
+		XCTAssertEqual([ownedStorage(p) length], sizeof(const int *));
+		XCTAssertEqual(*(const int **)[p pointerValue], cip);
+		XCTAssertEqual(**(const int **)[p pointerValue], 31);
+
+		HyperloopPointer *b = [HyperloopPointer create:cip encoding:@encode(const int *)];
+		XCTAssertEqualObjects([b encoding], @"^i");
+		XCTAssertEqual([b pointerValue], (void *)cip);
+		XCTAssertEqual([[b valueAtIndex:0] intValue], 31);
+	}
+	free(ip);
+}
+
+// a NULL source keeps its established meanings: pointer:encoding: copies nothing and holds a NULL
+// pointer in a zeroed slot it owns; create:encoding: borrows NULL itself
+- (void)testNullPointerEncodingSource {
+	@autoreleasepool {
+		HyperloopPointer *p = [HyperloopPointer pointer:NULL encoding:@encode(int *)];
+		XCTAssertEqual([ownedStorage(p) length], sizeof(int *));
+		XCTAssertTrue([p pointerValue] != NULL);
+		XCTAssertTrue(*(int **)[p pointerValue] == NULL);
+
+		HyperloopPointer *b = [HyperloopPointer create:NULL encoding:@encode(int *)];
+		XCTAssertTrue([b pointerValue] == NULL);
+		XCTAssertNil(ownedStorage(b));
 	}
 }
 
