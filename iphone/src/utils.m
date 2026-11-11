@@ -57,6 +57,13 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 			} else {
 				return copy;
 			}
+		} else if (invocation) {
+			// Only object parameters (not blocks, @?) receive the empty array; other encodings keep their existing handling.
+			const char *type = [cleanEncoding([NSString stringWithUTF8String:[[invocation methodSignature] getArgumentTypeAtIndex:index]]) UTF8String];
+			if (type[0] == '@' && type[1] != '?') {
+				NSMutableArray *copy = [NSMutableArray arrayWithArray:arg];
+				[invocation setArgument:&copy atIndex:index];
+			}
 		}
 	} else if ([arg isKindOfClass:[NSDictionary class]]) {
 		// see if we have a native property and if so, pull it out and treat it like a pointer
