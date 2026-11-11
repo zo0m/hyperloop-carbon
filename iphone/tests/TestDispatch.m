@@ -250,6 +250,7 @@ static void TestInitOwnershipResetCounters(void) {
 +(id)receivedValue;
 +(int)receivedBefore;
 +(int)receivedAfter;
++(int)enteredCount;
 @end
 
 typedef NS_ENUM(int, TestArrayArgumentKind) {
@@ -262,12 +263,17 @@ typedef NS_ENUM(int, TestArrayArgumentKind) {
 static id TestArrayArgumentValue;
 static int TestArrayArgumentBefore;
 static int TestArrayArgumentAfter;
+static int TestArrayArgumentEntered;
 
 @implementation TestArrayArgumentMock
 +(void)reset {
 	TestArrayArgumentValue = nil;
 	TestArrayArgumentBefore = 0;
 	TestArrayArgumentAfter = 0;
+	TestArrayArgumentEntered = 0;
+}
++(int)enteredCount {
+	return TestArrayArgumentEntered;
 }
 +(id)receivedValue {
 	return TestArrayArgumentValue;
@@ -300,6 +306,65 @@ static int TestArrayArgumentAfter;
 +(int)takeBlock:(void (^)(void))block {
 	TestArrayArgumentValue = block;
 	return block == nil ? TestArrayArgumentKindNil : TestArrayArgumentKindOther;
+}
+// Parameters an array cannot be converted to. Each only records that it was entered and
+// never reads its argument, so a bogus value cannot make the fixture itself unsafe.
++(int)takeIntValue:(int)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeDoubleValue:(double)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeBoolValue:(BOOL)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeClassValue:(Class)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeSelectorValue:(SEL)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeCString:(const char *)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeRect:(CGRect)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
++(int)takeObjectPointer:(const id *)value {
+	TestArrayArgumentEntered++;
+	return 0;
+}
+// Records only whether the pointer is NULL; it is never dereferenced.
++(int)takePointer:(void *)value {
+	TestArrayArgumentEntered++;
+	return value == NULL ? TestArrayArgumentKindNil : TestArrayArgumentKindOther;
+}
+// Only compares the block with nil: an invalid value is never called, copied or stored.
++(int)takeBlockValue:(void (^)(void))block {
+	TestArrayArgumentEntered++;
+	return block == nil ? TestArrayArgumentKindNil : TestArrayArgumentKindOther;
+}
++(int)takeInt:(int)before block:(void (^)(void))block {
+	TestArrayArgumentEntered++;
+	TestArrayArgumentBefore = before;
+	return 0;
+}
++(int)takeInt:(int)before pointer:(void *)value {
+	TestArrayArgumentEntered++;
+	TestArrayArgumentBefore = before;
+	return 0;
+}
+// The runtime encodes this parameter as "nO@": an object parameter behind two qualifiers.
++(int)takeQualifiedArray:(in bycopy NSArray *)value {
+	TestArrayArgumentValue = value;
+	return [self kindOf:value];
 }
 @end
 
@@ -842,6 +907,120 @@ static int TestArrayArgumentAfter;
 	id result = [HyperloopUtils invokeSelector:@selector(takeBlock:) args:@[@[]] target:cls instance:NO];
 	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNil));
 	XCTAssertNil([TestArrayArgumentMock receivedValue]);
+}
+
+// Asserts that passing array as the only argument of selector raises InvalidArgumentType
+// naming argument 0 and encoding, without entering the native method.
+- (void)assertArray:(NSArray *)array rejectedBy:(SEL)selector encoding:(NSString *)encoding {
+	[TestArrayArgumentMock reset];
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSException *caught = nil;
+	@try {
+		[HyperloopUtils invokeSelector:selector args:@[array] target:cls instance:NO];
+	} @catch (NSException *e) {
+		caught = e;
+	}
+	NSString *name = NSStringFromSelector(selector);
+	XCTAssertNotNil(caught, @"%@ accepted %@", name, array);
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType", @"%@", name);
+	NSString *expected = [NSString stringWithFormat:@"at argument 0 (%@)", encoding];
+	XCTAssertTrue([caught.reason hasSuffix:expected], @"%@: reason \"%@\" does not end with \"%@\"", name, caught.reason, expected);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0, @"%@ was entered", name);
+}
+
+- (void)assertArrayRejectedByNonObjectParameters:(NSArray *)array {
+	[self assertArray:array rejectedBy:@selector(takeIntValue:) encoding:@"i"];
+	[self assertArray:array rejectedBy:@selector(takeDoubleValue:) encoding:@"d"];
+	[self assertArray:array rejectedBy:@selector(takeBoolValue:) encoding:@(@encode(BOOL))];
+	[self assertArray:array rejectedBy:@selector(takeClassValue:) encoding:@"#"];
+	[self assertArray:array rejectedBy:@selector(takeSelectorValue:) encoding:@":"];
+	[self assertArray:array rejectedBy:@selector(takePointer:) encoding:@"^v"];
+	// Qualified encodings ("r^@", "r*") are reported without their qualifier.
+	[self assertArray:array rejectedBy:@selector(takeObjectPointer:) encoding:@"^@"];
+	[self assertArray:array rejectedBy:@selector(takeCString:) encoding:@"*"];
+	[self assertArray:array rejectedBy:@selector(takeRect:) encoding:@(@encode(CGRect))];
+}
+
+- (void)testEmptyArrayRejectedForNonObjectParameters {
+	[self assertArrayRejectedByNonObjectParameters:@[]];
+}
+
+- (void)testNonEmptyArrayRejectedForNonObjectParameters {
+	[self assertArrayRejectedByNonObjectParameters:@[@1, @"two"]];
+}
+
+- (void)testArrayRejectionNamesArgumentIndex {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSException *caught = nil;
+	@try {
+		[HyperloopUtils invokeSelector:@selector(takeInt:pointer:) args:@[@7, @[]] target:cls instance:NO];
+	} @catch (NSException *e) {
+		caught = e;
+	}
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType");
+	XCTAssertTrue([caught.reason hasSuffix:@"at argument 1 (^v)"], @"%@", caught.reason);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0);
+	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 0);
+}
+
+- (void)testBlockFixtureHasBlockEncoding {
+	for (NSString *name in @[@"takeBlockValue:", @"takeBlock:"]) {
+		NSMethodSignature *sig = [TestArrayArgumentMock methodSignatureForSelector:NSSelectorFromString(name)];
+		XCTAssertEqualObjects(@([sig getArgumentTypeAtIndex:2]), @"@?", @"%@", name);
+	}
+}
+
+- (void)testNonEmptyArrayRejectedForBlockParameter {
+	[self assertArray:@[@1, @"two"] rejectedBy:@selector(takeBlockValue:) encoding:@"@?"];
+}
+
+- (void)testBlockRejectionNamesArgumentIndex {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSException *caught = nil;
+	@try {
+		[HyperloopUtils invokeSelector:@selector(takeInt:block:) args:@[@7, @[@1]] target:cls instance:NO];
+	} @catch (NSException *e) {
+		caught = e;
+	}
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType");
+	XCTAssertTrue([caught.reason hasSuffix:@"at argument 1 (@?)"], @"%@", caught.reason);
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 0);
+	XCTAssertEqual([TestArrayArgumentMock receivedBefore], 0);
+}
+
+- (void)testEmptyArrayBlockValueStaysNil {
+	// Unchanged compatibility control: an empty array to a block parameter still arrives as nil.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(takeBlockValue:) args:@[@[]] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNil));
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 1);
+}
+
+- (void)testNullPointerArgumentStillAccepted {
+	// Control: NSNull to a pointer parameter is not an array and still arrives as NULL.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(takePointer:) args:@[[NSNull null]] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNil));
+	XCTAssertEqual([TestArrayArgumentMock enteredCount], 1);
+}
+
+- (void)testEmptyArrayDoublyQualifiedObjectArgument {
+	// "nO@" is an object parameter; skipping only one qualifier would misclassify it.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(takeQualifiedArray:) args:@[@[]] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindEmptyArray));
+	id received = [TestArrayArgumentMock receivedValue];
+	XCTAssertTrue([received isKindOfClass:[NSArray class]]);
+	XCTAssertEqual([received count], 0);
+}
+
+- (void)testNonEmptyArrayDoublyQualifiedObjectArgument {
+	// Control: the non-empty path to a qualified object parameter keeps its contents and order.
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestArrayArgumentMock" alloc:NO init:@selector(class) args:nil];
+	NSArray *value = @[@1, @"two", @[@3]];
+	id result = [HyperloopUtils invokeSelector:@selector(takeQualifiedArray:) args:@[value] target:cls instance:NO];
+	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNonEmptyArray));
+	XCTAssertEqualObjects([TestArrayArgumentMock receivedValue], value);
 }
 
 @end
