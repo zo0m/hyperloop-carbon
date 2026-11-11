@@ -17,6 +17,9 @@
 @end
 
 @interface TestDispatchMock : NSObject
+@property (nonatomic, assign) int receivedLeading;
+@property (nonatomic, assign) unsigned int receivedUnsigned;
+@property (nonatomic, assign) int receivedTrailing;
 @end
 
 @implementation TestDispatchMock
@@ -61,6 +64,14 @@
 }
 -(unsigned int)testWithUnsignedInt:(unsigned int)value {
 	return value + 1;
+}
+-(unsigned long long)testWithUnsignedIntReceived:(unsigned int)value {
+	return value;
+}
+-(void)testWithLeading:(int)leading unsignedInt:(unsigned int)value trailing:(int)trailing {
+	_receivedLeading = leading;
+	_receivedUnsigned = value;
+	_receivedTrailing = trailing;
 }
 -(unsigned long)testWithUnsignedLong:(unsigned long)value {
 	return value + 1;
@@ -647,6 +658,70 @@ static int TestArrayArgumentEntered;
 	HyperloopPointer *result = [HyperloopUtils invokeSelector:@selector(testWithUnsignedInt:) args:@[ptr] target:cls instance:YES];
 	XCTAssertNotNil(result);
 	XCTAssertEqual([result unsignedIntValue], 2);
+}
+
+static const unsigned int TestUnsignedIntArgumentValues[] = { 0u, 42u, (unsigned int)INT_MAX + 1u, UINT_MAX };
+
+- (void)testUnsignedIntArgumentFixtureEncoding {
+	XCTAssertEqual(sizeof(unsigned int), 4u);
+	XCTAssertEqual(UINT_MAX, 0xFFFFFFFFu);
+	XCTAssertGreaterThan((unsigned long long)INT_MAX + 1u, (unsigned long long)INT_MAX);
+	NSMethodSignature *sig = [TestDispatchMock instanceMethodSignatureForSelector:@selector(testWithUnsignedIntReceived:)];
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:2], "I"), 0);
+	sig = [TestDispatchMock instanceMethodSignatureForSelector:@selector(testWithLeading:unsignedInt:trailing:)];
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:2], "i"), 0);
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:3], "I"), 0);
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:4], "i"), 0);
+}
+
+- (void)testWithUnsignedIntNumberArgument {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestDispatchMock" alloc:YES init:@selector(init) args:nil];
+	for (size_t i = 0; i < sizeof(TestUnsignedIntArgumentValues) / sizeof(TestUnsignedIntArgumentValues[0]); i++) {
+		unsigned int value = TestUnsignedIntArgumentValues[i];
+		// integer-backed NSNumber, and double-backed NSNumber as produced from a JS number
+		NSArray *inputs = @[ [NSNumber numberWithUnsignedInt:value], [NSNumber numberWithDouble:(double)value] ];
+		for (NSNumber *input in inputs) {
+			id result = [HyperloopUtils invokeSelector:@selector(testWithUnsignedIntReceived:) args:@[input] target:cls instance:YES];
+			XCTAssertTrue([result isKindOfClass:[NSNumber class]]);
+			XCTAssertEqual([result unsignedLongLongValue], (unsigned long long)value, @"input %@ (%s)", input, [input objCType]);
+		}
+	}
+}
+
+- (void)testWithUnsignedIntNumberBetweenArguments {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestDispatchMock" alloc:YES init:@selector(init) args:nil];
+	TestDispatchMock *mock = [cls target];
+	for (size_t i = 0; i < sizeof(TestUnsignedIntArgumentValues) / sizeof(TestUnsignedIntArgumentValues[0]); i++) {
+		unsigned int value = TestUnsignedIntArgumentValues[i];
+		mock.receivedLeading = 0;
+		mock.receivedUnsigned = 0xDEADBEEFu;
+		mock.receivedTrailing = 0;
+		NSArray *args = @[ @(-7), [NSNumber numberWithDouble:(double)value], @(INT_MIN) ];
+		[HyperloopUtils invokeSelector:@selector(testWithLeading:unsignedInt:trailing:) args:args target:cls instance:YES];
+		XCTAssertEqual(mock.receivedLeading, -7);
+		XCTAssertEqual(mock.receivedUnsigned, value);
+		XCTAssertEqual(mock.receivedTrailing, INT_MIN);
+	}
+}
+
+- (void)testWithUnsignedIntPointerArgumentLimits {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestDispatchMock" alloc:YES init:@selector(init) args:nil];
+	for (size_t i = 0; i < sizeof(TestUnsignedIntArgumentValues) / sizeof(TestUnsignedIntArgumentValues[0]); i++) {
+		unsigned int value = TestUnsignedIntArgumentValues[i];
+		HyperloopPointer *ptr = [HyperloopPointer pointer:&value encoding:@encode(unsigned int)];
+		id result = [HyperloopUtils invokeSelector:@selector(testWithUnsignedIntReceived:) args:@[ptr] target:cls instance:YES];
+		XCTAssertEqual([result unsignedLongLongValue], (unsigned long long)value);
+	}
+}
+
+- (void)testWithIntNumberArgument {
+	HyperloopClass *cls = [[HyperloopClass alloc] initWithClassName:@"TestDispatchMock" alloc:YES init:@selector(init) args:nil];
+	id result = [HyperloopUtils invokeSelector:@selector(testWithInt:) args:@[ @(-42) ] target:cls instance:YES];
+	XCTAssertEqual([result intValue], -41);
+	result = [HyperloopUtils invokeSelector:@selector(testWithInt:) args:@[ [NSNumber numberWithDouble:-42] ] target:cls instance:YES];
+	XCTAssertEqual([result intValue], -41);
+	result = [HyperloopUtils invokeSelector:@selector(testWithInt:) args:@[ @(INT_MIN) ] target:cls instance:YES];
+	XCTAssertEqual([result intValue], INT_MIN + 1);
 }
 
 - (void)testWithUnsignedShortValue {

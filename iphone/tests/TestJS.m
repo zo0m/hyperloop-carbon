@@ -180,10 +180,22 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 }
 @end
 
+static int TestJSReceivedLeading;
+static unsigned int TestJSReceivedUnsigned;
+static int TestJSReceivedTrailing;
+
 @interface TestJSExample : NSObject
 @end
 
 @implementation TestJSExample
++(unsigned long long)testUnsignedIntArg:(unsigned int)value {
+	return value;
+}
++(void)testLeading:(int)leading unsignedInt:(unsigned int)value trailing:(int)trailing {
+	TestJSReceivedLeading = leading;
+	TestJSReceivedUnsigned = value;
+	TestJSReceivedTrailing = trailing;
+}
 +(int)testInt {
 	return 2;
 }
@@ -769,6 +781,57 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
 	XCTAssertTrue(exception == NULL);
 	XCTAssertTrue(JSValueIsNull(_ctx.context, result));
+}
+
+-(void)testUnsignedIntNumberArg {
+	NSMethodSignature *sig = [TestJSExample methodSignatureForSelector:@selector(testUnsignedIntArg:)];
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:2], "I"), 0);
+	const unsigned int values[] = { 0u, 42u, (unsigned int)INT_MAX + 1u, UINT_MAX };
+	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		char source[256];
+		snprintf(source, sizeof(source), "(function() { var cls = Hyperloop.createProxy({class:'TestJSExample', alloc:false, init:'class' }); return Hyperloop.dispatch(cls, 'testUnsignedIntArg:', %u); })()", values[i]);
+		JSValueRef exception = NULL;
+		JSStringRef script = JSStringCreateWithUTF8CString(source);
+		JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+		JSStringRelease(script);
+		XCTAssertTrue(exception == NULL);
+		if (exception != NULL) {
+			return;
+		}
+		XCTAssertTrue(result != NULL);
+		if (result == NULL) {
+			return;
+		}
+		XCTAssertTrue(JSValueIsNumber(_ctx.context, result));
+		XCTAssertEqual(JSValueToNumber(_ctx.context, result, &exception), (double)values[i]);
+	}
+}
+
+-(void)testUnsignedIntNumberArgBetweenArgs {
+	const unsigned int values[] = { 0u, 42u, (unsigned int)INT_MAX + 1u, UINT_MAX };
+	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		TestJSReceivedLeading = 0;
+		TestJSReceivedUnsigned = 0xDEADBEEFu;
+		TestJSReceivedTrailing = 0;
+		char source[256];
+		snprintf(source, sizeof(source), "(function() { var cls = Hyperloop.createProxy({class:'TestJSExample', alloc:false, init:'class' }); return Hyperloop.dispatch(cls, 'testLeading:unsignedInt:trailing:', [-7, %u, 99]); })()", values[i]);
+		JSValueRef exception = NULL;
+		JSStringRef script = JSStringCreateWithUTF8CString(source);
+		JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+		JSStringRelease(script);
+		XCTAssertTrue(exception == NULL);
+		if (exception != NULL) {
+			return;
+		}
+		XCTAssertTrue(result != NULL);
+		if (result == NULL) {
+			return;
+		}
+		XCTAssertTrue(JSValueIsNull(_ctx.context, result));
+		XCTAssertEqual(TestJSReceivedLeading, -7);
+		XCTAssertEqual(TestJSReceivedUnsigned, values[i]);
+		XCTAssertEqual(TestJSReceivedTrailing, 99);
+	}
 }
 
 - (void)testKrollCallbackWithIdentifier {
