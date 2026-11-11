@@ -152,6 +152,32 @@ static SEL TestPointerReturnBytePointerSelector(void) {
 @end
 
 /**
+ * Receives raw pointer arguments (NSValue or NSNumber, not HyperloopPointer) and
+ * reports the address it was given.
+ */
+@interface TestPointerArgumentMock : NSObject
+@property (nonatomic, assign) int receivedLeading;
+@property (nonatomic, assign) int receivedTrailing;
+@end
+
+@implementation TestPointerArgumentMock
+-(uintptr_t)addressOfPointer:(void *)pointer {
+	return (uintptr_t)pointer;
+}
+-(uintptr_t)addressOfConstPointer:(const void *)pointer {
+	return (uintptr_t)pointer;
+}
+-(void)writeInt:(int)value toPointer:(int *)pointer {
+	*pointer = value;
+}
+-(uintptr_t)addressWithLeading:(int)leading pointer:(void *)pointer trailing:(int)trailing {
+	_receivedLeading = leading;
+	_receivedTrailing = trailing;
+	return (uintptr_t)pointer;
+}
+@end
+
+/**
  * Counts allocations and deallocations so tests can check that the bridge
  * neither leaks nor over-releases instances it constructs. Initializers follow
  * ARC init-family conventions: they consume self and return +1.
@@ -269,6 +295,56 @@ static void TestInitOwnershipResetCounters(void) {
 	XCTAssertNil(result);
 	id value = [ptr valueAtIndex:0];
 	XCTAssertEqual([value intValue], 12);
+}
+
+- (void)testPointerArgumentFixtureEncoding {
+	XCTAssertEqual(strcmp([[TestPointerArgumentMock instanceMethodSignatureForSelector:@selector(addressOfPointer:)] getArgumentTypeAtIndex:2], "^v"), 0);
+	XCTAssertEqual(strcmp([[TestPointerArgumentMock instanceMethodSignatureForSelector:@selector(addressOfConstPointer:)] getArgumentTypeAtIndex:2], "r^v"), 0);
+	XCTAssertEqual(strcmp([[TestPointerArgumentMock instanceMethodSignatureForSelector:@selector(writeInt:toPointer:)] getArgumentTypeAtIndex:3], "^i"), 0);
+	NSMethodSignature *sig = [TestPointerArgumentMock instanceMethodSignatureForSelector:@selector(addressWithLeading:pointer:trailing:)];
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:2], "i"), 0);
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:3], "^v"), 0);
+	XCTAssertEqual(strcmp([sig getArgumentTypeAtIndex:4], "i"), 0);
+}
+
+// the native method must receive the address held by the NSValue, not the bytes stored at it
+- (void)testPointerArgumentFromValue {
+	TestPointerArgumentMock *mock = [[TestPointerArgumentMock alloc] init];
+	uint64_t pointee = 0x1122334455667788ULL;
+	NSValue *value = [NSValue valueWithPointer:&pointee];
+	id result = [HyperloopUtils invokeSelector:@selector(addressOfPointer:) args:@[value] target:mock instance:YES];
+	XCTAssertEqual([result unsignedLongValue], (uintptr_t)&pointee);
+	result = [HyperloopUtils invokeSelector:@selector(addressOfConstPointer:) args:@[value] target:mock instance:YES];
+	XCTAssertEqual([result unsignedLongValue], (uintptr_t)&pointee);
+	XCTAssertEqual(pointee, 0x1122334455667788ULL);
+}
+
+- (void)testPointerArgumentFromNullValue {
+	TestPointerArgumentMock *mock = [[TestPointerArgumentMock alloc] init];
+	id result = [HyperloopUtils invokeSelector:@selector(addressOfPointer:) args:@[ [NSValue valueWithPointer:NULL] ] target:mock instance:YES];
+	XCTAssertEqual([result unsignedLongValue], 0ul);
+	// a JS 0 arrives as a double-backed NSNumber
+	result = [HyperloopUtils invokeSelector:@selector(addressOfPointer:) args:@[ [NSNumber numberWithDouble:0] ] target:mock instance:YES];
+	XCTAssertEqual([result unsignedLongValue], 0ul);
+}
+
+- (void)testPointerArgumentWritesThroughValue {
+	TestPointerArgumentMock *mock = [[TestPointerArgumentMock alloc] init];
+	int *storage = calloc(2, sizeof(int));
+	[HyperloopUtils invokeSelector:@selector(writeInt:toPointer:) args:@[ @77, [NSValue valueWithPointer:storage] ] target:mock instance:YES];
+	XCTAssertEqual(storage[0], 77);
+	XCTAssertEqual(storage[1], 0);
+	free(storage);
+}
+
+- (void)testPointerArgumentBetweenArguments {
+	TestPointerArgumentMock *mock = [[TestPointerArgumentMock alloc] init];
+	uint64_t pointee = 0x1122334455667788ULL;
+	NSArray *args = @[ @(-7), [NSValue valueWithPointer:&pointee], @(INT_MIN) ];
+	id result = [HyperloopUtils invokeSelector:@selector(addressWithLeading:pointer:trailing:) args:args target:mock instance:YES];
+	XCTAssertEqual([result unsignedLongValue], (uintptr_t)&pointee);
+	XCTAssertEqual(mock.receivedLeading, -7);
+	XCTAssertEqual(mock.receivedTrailing, INT_MIN);
 }
 
 - (void)testWithIntPointerResult {

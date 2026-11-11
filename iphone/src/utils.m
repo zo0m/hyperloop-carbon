@@ -159,7 +159,7 @@ id JSValueRefToId (JSContextRef ctx, const JSValueRef value, JSValueRef *excepti
 				}
 				case '^': {
 					void *p = [arg pointerValue];
-					[invocation setArgument:p atIndex:index];
+					[invocation setArgument:&p atIndex:index];
 					break;
 				}
 				default: {

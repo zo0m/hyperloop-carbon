@@ -102,6 +102,9 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 		@throw [NSException exceptionWithName:@"InvalidArg" reason:@"time should have been 12.3" userInfo:nil];
 	}
 }
++(uintptr_t)addressOfPointer:(void *)pointer {
+	return (uintptr_t)pointer;
+}
 @end
 
 @interface TestJS : XCTestCase
@@ -674,6 +677,30 @@ JSValueRef KrollCallbackFunction (JSContextRef ctx, JSObjectRef function, JSObje
 	JSStringRelease(name);
 	id result = [HyperloopUtils invokeCustomCallback:@[] identifier:@"123" thisObject:nil];
 	XCTAssertNotNil(result);
+}
+
+// a JS 0 or null passed to a pointer parameter arrives as NULL
+-(void)testNullPointerArg {
+	XCTAssertEqual(strcmp([[TestJSExample methodSignatureForSelector:@selector(addressOfPointer:)] getArgumentTypeAtIndex:2], "^v"), 0);
+	const char *args[] = { "0", "null" };
+	for (size_t i = 0; i < sizeof(args) / sizeof(args[0]); i++) {
+		char source[256];
+		snprintf(source, sizeof(source), "(function() { var cls = Hyperloop.createProxy({class:'TestJSExample', alloc:false, init:'class' }); return Hyperloop.dispatch(cls, 'addressOfPointer:', [%s]); })()", args[i]);
+		JSValueRef exception = NULL;
+		JSStringRef script = JSStringCreateWithUTF8CString(source);
+		JSValueRef result = JSEvaluateScript(_ctx.context, script, NULL, NULL, 0, &exception);
+		JSStringRelease(script);
+		XCTAssertTrue(exception == NULL);
+		if (exception != NULL) {
+			return;
+		}
+		XCTAssertTrue(result != NULL);
+		if (result == NULL) {
+			return;
+		}
+		XCTAssertTrue(JSValueIsNumber(_ctx.context, result));
+		XCTAssertEqual(JSValueToNumber(_ctx.context, result, &exception), 0.0);
+	}
 }
 
 -(id)convertScript:(const char *)source exception:(JSValueRef *)exception {
