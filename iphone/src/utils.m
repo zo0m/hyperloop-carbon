@@ -238,6 +238,14 @@ case enc: {\
  * invoke a selector and return the result
  */
 +(id)invokeSelector:(SEL)aSelector args:(NSArray *)args target:(id)obj instance:(BOOL)instanceMethod {
+	return [HyperloopUtils invokeSelector:aSelector args:args target:obj instance:instanceMethod beforeInvoke:nil];
+}
+
+/**
+ * invoke a selector and return the result; beforeInvoke runs once every argument has been
+ * converted, immediately before the method is invoked, and is not run when conversion throws
+ */
++(id)invokeSelector:(SEL)aSelector args:(NSArray *)args target:(id)obj instance:(BOOL)instanceMethod beforeInvoke:(void (^)(void))beforeInvoke {
 #if defined(DEBUG_INVOKE) && DEBUG_INVOKE == 1
 	NSLog(@"[DEBUG] invokeSelector %@ (%@) -> %@ (%d)", NSStringFromSelector(aSelector), args, [obj class], (int)instanceMethod);
 #endif
@@ -290,6 +298,9 @@ case enc: {\
 #if defined(DEBUG_INVOKE) && DEBUG_INVOKE == 1
 		NSLog(@"[DEBUG] calling invoke on %@ -> %@", [obj class], NSStringFromSelector(aSelector));
 #endif
+		if (beforeInvoke) {
+			beforeInvoke();
+		}
 		[invocation invoke];
 		NSUInteger length = [signature methodReturnLength];
 		const char *type = signature.methodReturnType;
