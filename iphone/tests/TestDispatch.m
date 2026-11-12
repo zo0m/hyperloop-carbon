@@ -379,6 +379,40 @@ static int TestArrayArgumentEntered;
 }
 @end
 
+/**
+ * Construction targets whose argument conversion throws. Each counts entries and
+ * deallocations so a test can tell whether the allocated instance was released.
+ */
+static int TestThrowingInitEntered;
+static int TestThrowingInitDeallocs;
+static int TestThrowingInitArgumentDeallocs;
+
+@interface TestThrowingInitArgument : NSObject
+@end
+
+@implementation TestThrowingInitArgument
+-(void)dealloc {
+	TestThrowingInitArgumentDeallocs++;
+}
+@end
+
+@interface TestThrowingInitMock : NSObject
+@end
+
+@implementation TestThrowingInitMock
+-(instancetype)initWithObject:(id)object value:(int)value {
+	TestThrowingInitEntered++;
+	return [super init];
+}
+-(id)configureWithObject:(id)object value:(int)value {
+	TestThrowingInitEntered++;
+	return self;
+}
+-(void)dealloc {
+	TestThrowingInitDeallocs++;
+}
+@end
+
 @implementation TestDispatch
 
 -(void)tearDown {
@@ -1096,6 +1130,84 @@ static const unsigned int TestUnsignedIntArgumentValues[] = { 0u, 42u, (unsigned
 	id result = [HyperloopUtils invokeSelector:@selector(takeQualifiedArray:) args:@[value] target:cls instance:NO];
 	XCTAssertEqualObjects(result, @(TestArrayArgumentKindNonEmptyArray));
 	XCTAssertEqualObjects([TestArrayArgumentMock receivedValue], value);
+}
+
+
+-(void)resetThrowingInitCounters {
+	TestThrowingInitEntered = 0;
+	TestThrowingInitDeallocs = 0;
+	TestThrowingInitArgumentDeallocs = 0;
+}
+
+- (void)testInitArgumentErrorReleasesAllocatedInstance {
+	[self resetThrowingInitCounters];
+	NSException *caught = nil;
+	@autoreleasepool {
+		// Arguments are built outside @try: this test file is compiled without ARC exception
+		// cleanups, so a temporary created inside the @try would itself leak on the throw.
+		NSArray *args = @[[[TestThrowingInitArgument alloc] init], @[]];
+		@try {
+			(void)[[HyperloopClass alloc] initWithClassName:@"TestThrowingInitMock" alloc:YES init:@selector(initWithObject:value:) args:args];
+		} @catch (NSException *e) {
+			caught = e;
+		}
+	}
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType");
+	XCTAssertEqual(TestThrowingInitEntered, 0);
+	XCTAssertEqual(TestThrowingInitDeallocs, 1, @"allocated instance leaked");
+	XCTAssertEqual(TestThrowingInitArgumentDeallocs, 1, @"argument retained by the invocation leaked");
+}
+
+- (void)testInitWrongArgumentCountReleasesAllocatedInstance {
+	[self resetThrowingInitCounters];
+	NSException *caught = nil;
+	@autoreleasepool {
+		NSArray *args = @[@1];
+		@try {
+			(void)[[HyperloopClass alloc] initWithClassName:@"TestThrowingInitMock" alloc:YES init:@selector(initWithObject:value:) args:args];
+		} @catch (NSException *e) {
+			caught = e;
+		}
+	}
+	XCTAssertEqualObjects(caught.name, @"WrongArgumentCount");
+	XCTAssertEqual(TestThrowingInitEntered, 0);
+	XCTAssertEqual(TestThrowingInitDeallocs, 1, @"allocated instance leaked");
+}
+
+- (void)testNonInitArgumentErrorReleasesAllocatedInstance {
+	[self resetThrowingInitCounters];
+	NSException *caught = nil;
+	@autoreleasepool {
+		NSArray *args = @[[[TestThrowingInitArgument alloc] init], @[]];
+		@try {
+			(void)[[HyperloopClass alloc] initWithClassName:@"TestThrowingInitMock" alloc:YES init:@selector(configureWithObject:value:) args:args];
+		} @catch (NSException *e) {
+			caught = e;
+		}
+	}
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType");
+	XCTAssertEqual(TestThrowingInitEntered, 0);
+	XCTAssertEqual(TestThrowingInitDeallocs, 1, @"allocated instance leaked");
+	XCTAssertEqual(TestThrowingInitArgumentDeallocs, 1, @"argument retained by the invocation leaked");
+}
+
+- (void)testInvokeArgumentErrorReleasesRetainedArguments {
+	[self resetThrowingInitCounters];
+	NSException *caught = nil;
+	@autoreleasepool {
+		TestThrowingInitMock *target = [[TestThrowingInitMock alloc] initWithObject:nil value:0];
+		TestThrowingInitEntered = 0;
+		NSArray *args = @[[[TestThrowingInitArgument alloc] init], @[]];
+		@try {
+			[HyperloopUtils invokeSelector:@selector(configureWithObject:value:) args:args target:target instance:YES];
+		} @catch (NSException *e) {
+			caught = e;
+		}
+	}
+	XCTAssertEqualObjects(caught.name, @"InvalidArgumentType");
+	XCTAssertEqual(TestThrowingInitEntered, 0);
+	XCTAssertEqual(TestThrowingInitDeallocs, 1, @"target leaked");
+	XCTAssertEqual(TestThrowingInitArgumentDeallocs, 1, @"argument retained by the invocation leaked");
 }
 
 @end

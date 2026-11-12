@@ -21,6 +21,12 @@
 +(id)invokeSelector:(SEL)aSelector args:(NSArray *)args target:(id)obj instance:(BOOL)instanceMethod;
 
 /**
+ * invoke a selector and return the result; beforeInvoke runs once every argument has been
+ * converted, immediately before the method is invoked, and is not run when conversion throws
+ */
++(id)invokeSelector:(SEL)aSelector args:(NSArray *)args target:(id)obj instance:(BOOL)instanceMethod beforeInvoke:(void (^)(void))beforeInvoke;
+
+/**
  * invoke a callback
  */
 +(void)invokeCallback:(id)callback args:(NSArray *)args thisObject:(id)thisObject;

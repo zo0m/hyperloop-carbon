@@ -44,11 +44,14 @@ static BOOL IsInitFamilySelector(SEL sel) {
 		if (alloc && IsInitFamilySelector(init)) {
 			// alloc returns +1. An init-family method consumes that reference and returns
 			// its result (self, nil or a replacement) at +1, but NSInvocation calls it as an
-			// ordinary method, so ARC performs neither transfer. Hand the allocation's
-			// reference to the initializer instead of releasing it again here, and drop the
-			// returned reference once the result wrapper has retained the object.
-			void *allocated = (__bridge_retained void *)[c alloc];
-			nativeObject = [HyperloopUtils invokeSelector:init args:args target:(__bridge id)allocated instance:YES];
+			// ordinary method, so ARC performs neither transfer. Give the initializer its own
+			// reference once the arguments have been converted, so a conversion error leaves
+			// the allocation to ARC, and drop the returned reference once the result wrapper
+			// has retained the object.
+			id allocated = [c alloc];
+			nativeObject = [HyperloopUtils invokeSelector:init args:args target:allocated instance:YES beforeInvoke:^{
+				(void)CFBridgingRetain(allocated);
+			}];
 			CFBridgingRelease((__bridge CFTypeRef)[nativeObject objectValue]);
 		} else {
 			id instance = nil;
